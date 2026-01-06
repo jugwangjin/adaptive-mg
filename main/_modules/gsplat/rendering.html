@@ -912,6 +912,13 @@
         <span class="c1"># make it apple-to-apple with Inria&#39;s CUDA Backend.</span>
         <span class="n">colors</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">clamp_min</span><span class="p">(</span><span class="n">colors</span> <span class="o">+</span> <span class="mf">0.5</span><span class="p">,</span> <span class="mf">0.0</span><span class="p">)</span>
 
+
+    <span class="n">meta</span><span class="o">.</span><span class="n">update</span><span class="p">(</span>
+        <span class="p">{</span>
+            <span class="s2">&quot;colors&quot;</span><span class="p">:</span> <span class="n">colors</span><span class="p">,</span>
+        <span class="p">}</span>
+    <span class="p">)</span>
+
     <span class="c1"># If in distributed mode, we need to scatter the GSs to the destination ranks, based</span>
     <span class="c1"># on which cameras they are visible to, which we already figured out in the projection</span>
     <span class="c1"># stage.</span>
