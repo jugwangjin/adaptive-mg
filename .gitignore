@@ -1,3 +1,9 @@
+comparison_graphs/
+reference_codes/
+@eaDir/
+Thumbs.db
+
+
 .clangd
 compile_commands.json
 

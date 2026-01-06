@@ -15,7 +15,8 @@ import tqdm
 import tyro
 import viser
 import yaml
-from datasets.colmap import Dataset, Parser
+from datasets.colmap import Dataset as ColmapDataset, Parser as ColmapParser
+from datasets.nerf import Dataset as NerfDataset, Parser as NerfParser
 from datasets.traj import (
     generate_ellipse_path_z,
     generate_interpolated_path,
@@ -34,16 +35,17 @@ from gsplat import export_splats
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
-from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
+from gsplat.strategy.multigrid import MultigridStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
+from multigrid_gaussians import MultigridGaussians
 
 
 @dataclass
 class Config:
     # Disable viewer
-    disable_viewer: bool = False
+    disable_viewer: bool = True
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
     # Name of compression strategy to use
@@ -51,12 +53,18 @@ class Config:
     # Render trajectory path
     render_traj_path: str = "interp"
 
-    # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    # Dataset type: "colmap" or "nerf"
+    dataset_type: Literal["colmap", "nerf"] = "colmap"
+    # Path to the dataset directory
+    data_dir: Optional[str] = None
+    # Directory to save results (if None, auto-generated from data_dir)
+    result_dir: Optional[str] = None
     # Downsample factor for the dataset
     data_factor: int = 4
-    # Directory to save results
-    result_dir: str = "results/garden"
+    # For NeRF datasets: use white background for RGBA images
+    white_background: bool = False
+    # For NeRF datasets: image file extension
+    image_extension: str = ".png"
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -79,20 +87,15 @@ class Config:
     # Number of training steps
     max_steps: int = 30_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
-    # Interval for metric measurement (every N steps). -1 means disable metric measurement.
-    metric_interval: int = -1
+    eval_steps: List[int] = field(default_factory=lambda: [30_000])
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [30_000])
     # Whether to save ply file (storage size can be large)
     save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    ply_steps: List[int] = field(default_factory=lambda: [30_000])
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
-
-    # Visualization: interval to save visualization images (GT vs render)
-    visualization_interval: int = 200
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -117,8 +120,8 @@ class Config:
     far_plane: float = 1e10
 
     # Strategy for GS densification
-    strategy: Union[DefaultStrategy, MCMCStrategy] = field(
-        default_factory=DefaultStrategy
+    strategy: Union[DefaultStrategy, MCMCStrategy, MultigridStrategy] = field(
+        default_factory=lambda: MultigridStrategy(verbose=True)
     )
     # Use packed mode for rasterization, this leads to less memory usage but slightly slower.
     packed: bool = False
@@ -145,10 +148,16 @@ class Config:
     # LR for higher-order SH (detail)
     shN_lr: float = 2.5e-3 / 20
 
-    # Opacity regularization
-    opacity_reg: float = 0.0
+    # Opacity regularization (applied only to visible gaussians)
+    opacity_reg: float = 0
     # Scale regularization
     scale_reg: float = 0.0
+    # Position scale reduction for hierarchical gaussians
+    # Higher level gaussians are constrained to stay closer to their parents
+    position_scale_reduction: float = 0.5
+    # Maximum level for hierarchical structure
+    # If set, gaussians at max_level will only duplicate (not split) even if split conditions are met
+    max_level: Optional[int] = 8
 
     # Enable camera optimization.
     pose_opt: bool = False
@@ -192,6 +201,41 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
+    # Visualization: interval to save visualization images (GT vs render)
+    visualization_interval: int = 200
+
+    def __post_init__(self):
+        """Auto-generate result_dir if not provided."""
+        from pathlib import Path
+        
+        if self.data_dir is None:
+            if self.dataset_type == "colmap":
+                self.data_dir = "/Bean/data/gwangjin/2025/3dgs/garden"
+            elif self.dataset_type == "nerf":
+                self.data_dir = "/Bean/data/gwangjin/2025/3dgs/lego"
+            else:
+                raise ValueError(f"Unknown dataset_type: {self.dataset_type}")
+        
+        if self.result_dir is None:
+            # Extract dataset name from data_dir (last directory component)
+            dataset_name = Path(self.data_dir).name
+            
+            # Build settings string
+            settings_parts = [
+                f"type_{self.dataset_type}",
+                f"factor_{self.data_factor}",
+                "hierarchical",
+            ]
+            if self.dataset_type == "nerf" and self.white_background:
+                settings_parts.append("whitebg")
+            if self.normalize_world_space:
+                settings_parts.append("norm")
+            if self.patch_size is not None:
+                settings_parts.append(f"patch_{self.patch_size}")
+            
+            settings_str = "_".join(settings_parts)
+            self.result_dir = f"/Bean/log/gwangjin/2025/gsplat/hierarchical/{dataset_name}_{settings_str}"
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -200,7 +244,12 @@ class Config:
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
 
         strategy = self.strategy
-        if isinstance(strategy, DefaultStrategy):
+        if isinstance(strategy, MultigridStrategy):
+            strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
+            strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
+            strategy.reset_every = int(strategy.reset_every * factor)
+            strategy.refine_every = int(strategy.refine_every * factor)
+        elif isinstance(strategy, DefaultStrategy):
             strategy.refine_start_iter = int(strategy.refine_start_iter * factor)
             strategy.refine_stop_iter = int(strategy.refine_stop_iter * factor)
             strategy.reset_every = int(strategy.reset_every * factor)
@@ -213,101 +262,8 @@ class Config:
             assert_never(strategy)
 
 
-def create_splats_with_optimizers(
-    parser: Parser,
-    init_type: str = "sfm",
-    init_num_pts: int = 100_000,
-    init_extent: float = 3.0,
-    init_opacity: float = 0.1,
-    init_scale: float = 1.0,
-    means_lr: float = 1.6e-4,
-    scales_lr: float = 5e-3,
-    opacities_lr: float = 5e-2,
-    quats_lr: float = 1e-3,
-    sh0_lr: float = 2.5e-3,
-    shN_lr: float = 2.5e-3 / 20,
-    scene_scale: float = 1.0,
-    sh_degree: int = 3,
-    sparse_grad: bool = False,
-    visible_adam: bool = False,
-    batch_size: int = 1,
-    feature_dim: Optional[int] = None,
-    device: str = "cuda",
-    world_rank: int = 0,
-    world_size: int = 1,
-) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-    if init_type == "sfm":
-        points = torch.from_numpy(parser.points).float()
-        rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
-    elif init_type == "random":
-        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
-        rgbs = torch.rand((init_num_pts, 3))
-    else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
-
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
-
-    # Distribute the GSs to different ranks (also works for single rank)
-    points = points[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
-    scales = scales[world_rank::world_size]
-
-    N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
-
-    params = [
-        # name, value, lr
-        ("means", torch.nn.Parameter(points), means_lr * scene_scale),
-        ("scales", torch.nn.Parameter(scales), scales_lr),
-        ("quats", torch.nn.Parameter(quats), quats_lr),
-        ("opacities", torch.nn.Parameter(opacities), opacities_lr),
-    ]
-
-    if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
-    else:
-        # features will be used for appearance and view-dependent shading
-        features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), sh0_lr))
-        colors = torch.logit(rgbs)  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
-
-    splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
-    # Scale learning rate based on batch size, reference:
-    # https://www.cs.princeton.edu/~smalladi/blog/2024/01/22/SDEs-ScalingRules/
-    # Note that this would not make the training exactly equivalent, see
-    # https://arxiv.org/pdf/2402.18824v1
-    BS = batch_size * world_size
-    optimizer_class = None
-    if sparse_grad:
-        optimizer_class = torch.optim.SparseAdam
-    elif visible_adam:
-        optimizer_class = SelectiveAdam
-    else:
-        optimizer_class = torch.optim.Adam
-    optimizers = {
-        name: optimizer_class(
-            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
-            eps=1e-15 / math.sqrt(BS),
-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-            fused=True,
-        )
-        for name, _, lr in params
-    }
-    return splats, optimizers
-
-
 class Runner:
-    """Engine for training and testing."""
+    """Engine for training and testing with hierarchical Gaussians."""
 
     def __init__(
         self, local_rank: int, world_rank, world_size: int, cfg: Config
@@ -337,19 +293,38 @@ class Runner:
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
-        self.parser = Parser(
-            data_dir=cfg.data_dir,
-            factor=cfg.data_factor,
-            normalize=cfg.normalize_world_space,
-            test_every=cfg.test_every,
-        )
-        self.trainset = Dataset(
-            self.parser,
-            split="train",
-            patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss,
-        )
-        self.valset = Dataset(self.parser, split="val")
+        if cfg.dataset_type == "colmap":
+            self.parser = ColmapParser(
+                data_dir=cfg.data_dir,
+                factor=cfg.data_factor,
+                normalize=cfg.normalize_world_space,
+                test_every=cfg.test_every,
+            )
+            self.trainset = ColmapDataset(
+                self.parser,
+                split="train",
+                patch_size=cfg.patch_size,
+                load_depths=cfg.depth_loss,
+            )
+            self.valset = ColmapDataset(self.parser, split="val")
+        elif cfg.dataset_type == "nerf":
+            self.parser = NerfParser(
+                data_dir=cfg.data_dir,
+                factor=cfg.data_factor,
+                normalize=cfg.normalize_world_space,
+                test_every=cfg.test_every,
+                white_background=cfg.white_background,
+                extension=cfg.image_extension,
+            )
+            self.trainset = NerfDataset(
+                self.parser,
+                split="train",
+                patch_size=cfg.patch_size,
+                load_depths=cfg.depth_loss,
+            )
+            self.valset = NerfDataset(self.parser, split="val")
+        else:
+            raise ValueError(f"Unknown dataset type: {cfg.dataset_type}")
         
         # Sample 3 cameras from test set for visualization
         if cfg.visualization_interval > 0:
@@ -367,10 +342,10 @@ class Runner:
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
-        # Model
+        # Model: Use MultigridGaussians
         feature_dim = 32 if cfg.app_opt else None
-        self.splats, self.optimizers = create_splats_with_optimizers(
-            self.parser,
+        self.multigrid_gaussians = MultigridGaussians(
+            parser=self.parser,
             init_type=cfg.init_type,
             init_num_pts=cfg.init_num_pts,
             init_extent=cfg.init_extent,
@@ -391,13 +366,29 @@ class Runner:
             device=self.device,
             world_rank=world_rank,
             world_size=world_size,
+            position_scale_reduction=cfg.position_scale_reduction,
+            max_level=cfg.max_level,
         )
+        
+        # For compatibility with densification strategy, we need to expose splats and optimizers
+        self.splats = self.multigrid_gaussians.splats
+        self.optimizers = self.multigrid_gaussians.optimizers
+        
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
         # Densification Strategy
         self.cfg.strategy.check_sanity(self.splats, self.optimizers)
 
-        if isinstance(self.cfg.strategy, DefaultStrategy):
+        if isinstance(self.cfg.strategy, MultigridStrategy):
+            # MultigridStrategy requires hierarchical structure
+            self.strategy_state = self.cfg.strategy.initialize_state(
+                scene_scale=self.scene_scale,
+                levels=self.multigrid_gaussians.levels,
+                parent_indices=self.multigrid_gaussians.parent_indices,
+                level_indices=self.multigrid_gaussians.level_indices,
+                max_level=self.multigrid_gaussians.max_level,
+            )
+        elif isinstance(self.cfg.strategy, DefaultStrategy):
             self.strategy_state = self.cfg.strategy.initialize_state(
                 scene_scale=self.scene_scale
             )
@@ -508,58 +499,50 @@ class Runner:
         masks: Optional[Tensor] = None,
         rasterize_mode: Optional[Literal["classic", "antialiased"]] = None,
         camera_model: Optional[Literal["pinhole", "ortho", "fisheye"]] = None,
+        level: int = -1,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
-        means = self.splats["means"]  # [N, 3]
-        # quats = F.normalize(self.splats["quats"], dim=-1)  # [N, 4]
-        # rasterization does normalization internally
-        quats = self.splats["quats"]  # [N, 4]
-        scales = torch.exp(self.splats["scales"])  # [N, 3]
-        opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
-
-        image_ids = kwargs.pop("image_ids", None)
-        if self.cfg.app_opt:
-            colors = self.app_module(
-                features=self.splats["features"],
-                embed_ids=image_ids,
-                dirs=means[None, :, :] - camtoworlds[:, None, :3, 3],
-                sh_degree=kwargs.pop("sh_degree", self.cfg.sh_degree),
-            )
-            colors = colors + self.splats["colors"]
-            colors = torch.sigmoid(colors)
-        else:
-            colors = torch.cat([self.splats["sh0"], self.splats["shN"]], 1)  # [N, K, 3]
-
+        """Rasterize splats using MultigridGaussians.
+        
+        Args:
+            level: LOD level to render at. -1 means max LOD (default).
+        """
+        
+        # Set rasterize_mode if not provided
         if rasterize_mode is None:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
-        render_colors, render_alphas, info = rasterization(
-            means=means,
-            quats=quats,
-            scales=scales,
-            opacities=opacities,
-            colors=colors,
-            viewmats=torch.linalg.inv(camtoworlds),  # [C, 4, 4]
-            Ks=Ks,  # [C, 3, 3]
+        
+        # Get sh_degree from kwargs or use default
+        sh_degree = kwargs.pop("sh_degree", self.cfg.sh_degree)
+        
+        # Call MultigridGaussians.rasterize_splats
+        render_colors, render_alphas, info = self.multigrid_gaussians.rasterize_splats(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
             width=width,
             height=height,
+            level=level,  # Always use max LOD
+            masks=masks,
+            sh_degree=sh_degree,
+            near_plane=kwargs.pop("near_plane", self.cfg.near_plane),
+            far_plane=kwargs.pop("far_plane", self.cfg.far_plane),
+            rasterize_mode=rasterize_mode,
+            camera_model=camera_model,
             packed=self.cfg.packed,
+            sparse_grad=self.cfg.sparse_grad,
             absgrad=(
                 self.cfg.strategy.absgrad
                 if isinstance(self.cfg.strategy, DefaultStrategy)
                 else False
             ),
-            sparse_grad=self.cfg.sparse_grad,
-            rasterize_mode=rasterize_mode,
             distributed=self.world_size > 1,
-            camera_model=self.cfg.camera_model,
             with_ut=self.cfg.with_ut,
             with_eval3d=self.cfg.with_eval3d,
             **kwargs,
         )
-        if masks is not None:
-            render_colors[~masks] = 0
+        
         return render_colors, render_alphas, info
 
     def train(self):
@@ -634,7 +617,22 @@ class Runner:
 
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
-            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            image_data = data["image"].to(device) / 255.0  # [1, H, W, C] or [H, W, C]
+            
+            # Ensure batch dimension exists
+            if image_data.dim() == 3:
+                image_data = image_data.unsqueeze(0)  # [H, W, C] -> [1, H, W, C]
+            
+            # Handle RGBA images: extract RGB and alpha separately
+            if image_data.shape[-1] == 4:
+                pixels = image_data[..., :3]  # [1, H, W, 3]
+                pixels_alpha = image_data[..., 3:4]  # [1, H, W, 1]
+                has_alpha = True
+            else:
+                pixels = image_data  # [1, H, W, 3]
+                pixels_alpha = None
+                has_alpha = False
+            
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
@@ -655,7 +653,21 @@ class Runner:
             # sh schedule
             sh_degree_to_use = min(step // cfg.sh_degree_interval, cfg.sh_degree)
 
-            # forward
+            # Check if we have any GSs left
+            if len(self.splats["means"]) == 0:
+                print(f"ERROR: All Gaussian Splats have been pruned at step {step}. Training cannot continue.")
+                raise RuntimeError(f"No Gaussian Splats remaining at step {step}")
+
+            # Prepare backgrounds if needed
+            # backgrounds shape should be [..., C, D] where C is number of cameras, D is channels
+            # For camtoworlds shape [1, 4, 4], C=1, so backgrounds should be [1, 3]
+            backgrounds = None
+            if cfg.random_bkgd:
+                backgrounds = torch.rand(1, 3, device=device)  # [C=1, 3] for broadcasting
+            elif cfg.white_background:
+                backgrounds = torch.ones(1, 3, device=device)  # [C=1, 3] for white background
+            
+            # forward: Always use level=-1 (max LOD)
             renders, alphas, info = self.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -667,6 +679,7 @@ class Runner:
                 image_ids=image_ids,
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
                 masks=masks,
+                backgrounds=backgrounds,  # Pass backgrounds to rasterization
             )
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
@@ -687,10 +700,6 @@ class Runner:
                     image_ids.unsqueeze(-1),
                 )["rgb"]
 
-            if cfg.random_bkgd:
-                bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
-
             self.cfg.strategy.step_pre_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -705,6 +714,37 @@ class Runner:
                 colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
             )
             loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
+            
+            # # 여기서 colors와 pixels 이미지를 현재 디렉토리에 저장하고 exit() 
+            # # colors shape: [1, H, W, 3], convert to [H, W, 3] and uint8
+            # colors_np = colors[0].cpu().detach().numpy()  # [H, W, 3]
+            # if colors_np.shape[0] == 1 and len(colors_np.shape) == 4:
+            #     colors_np = colors_np[0]  # Remove batch dimension if present: [1, H, W, 3] -> [H, W, 3]
+            # colors_np = (colors_np * 255).clip(0, 255).astype(np.uint8)
+            # imageio.imwrite(f"colors_{step}.png", colors_np)
+            
+            # # pixels shape: [1, H, W, 3], convert to [H, W, 3] and uint8
+            # pixels_np = pixels[0].cpu().detach().numpy()  # [H, W, 3]
+            # if pixels_np.shape[0] == 1 and len(pixels_np.shape) == 4:
+            #     pixels_np = pixels_np[0]  # Remove batch dimension if present: [1, H, W, 3] -> [H, W, 3]
+            # pixels_np = (pixels_np * 255).clip(0, 255).astype(np.uint8)
+            # imageio.imwrite(f"pixels_{step}.png", pixels_np)
+            # exit()
+
+
+            # Opacity loss: if GT has alpha channel, add opacity loss
+            # print(has_alpha, pixels_alpha.shape)
+            # Disable opacity loss for now
+            if has_alpha and pixels_alpha is not None and False:
+                # alphas is [1, H, W, 1] from rasterize_splats
+                # pixels_alpha is [1, H, W, 1] from image_data
+                opacity_loss = F.l1_loss(alphas, pixels_alpha)
+                loss += opacity_loss * (1.0 - cfg.ssim_lambda)
+                opacity_loss_value = opacity_loss.item()
+                print(f"opacity_loss_value: {opacity_loss_value}")
+            else:
+                opacity_loss_value = 0.0
+            
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -728,31 +768,49 @@ class Runner:
                 tvloss = 10 * total_variation_loss(self.bil_grids.grids)
                 loss += tvloss
 
-            # regularizations
+            # Opacity regularization: Apply only to visible gaussians (used in rendering)
+            # This prevents high LOD gaussians from being pruned prematurely
             if cfg.opacity_reg > 0.0:
-                loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
+                # Get visible mask from the last rasterization (level=-1 was used)
+                # visible_mask is set by set_visible_mask() in rasterize_splats
+                visible_mask = self.multigrid_gaussians.visible_mask
+                
+                # Apply opacity regularization only to visible gaussians
+                visible_opacities = torch.sigmoid(self.splats["opacities"][visible_mask])
+                if len(visible_opacities) > 0:
+                    opacity_reg_loss = cfg.opacity_reg * visible_opacities.mean()
+                    loss += opacity_reg_loss
+                else:
+                    opacity_reg_loss = torch.tensor(0.0, device=device)
+            
+            # Scale regularization (applied to all gaussians)
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
 
             loss.backward()
 
-            desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            # # For trainable parameters, print grad 
+            # for name, param in self.splats.items():
+            #     if param.grad is not None:
+            #         grad_norm = param.grad.norm().item()
+            #         print(f"{name} grad: shape={param.grad.shape}, norm={grad_norm:.6f}")
+            #     else:
+            #         print(f"{name} grad: None")
+
+            max_level = self.multigrid_gaussians.levels.max().item()
+            desc = f"max_level={max_level}| loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
+            if has_alpha and pixels_alpha is not None and False:
+                desc += f"opacity loss={opacity_loss_value:.6f}| "
+            if cfg.opacity_reg > 0.0:
+                desc += f"opacity reg={opacity_reg_loss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
                 desc += f"pose err={pose_err.item():.6f}| "
+            
             pbar.set_description(desc)
-
-            # write images (gt and render)
-            # if world_rank == 0 and step % 800 == 0:
-            #     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-            #     canvas = canvas.reshape(-1, *canvas.shape[2:])
-            #     imageio.imwrite(
-            #         f"{self.render_dir}/train_rank{self.world_rank}.png",
-            #         (canvas * 255).astype(np.uint8),
-            #     )
 
             if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
                 mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -765,6 +823,10 @@ class Runner:
                     self.writer.add_scalar("train/depthloss", depthloss.item(), step)
                 if cfg.use_bilateral_grid:
                     self.writer.add_scalar("train/tvloss", tvloss.item(), step)
+                if has_alpha and pixels_alpha is not None and False:
+                    self.writer.add_scalar("train/opacity_loss", opacity_loss_value, step)
+                if cfg.opacity_reg > 0.0:
+                    self.writer.add_scalar("train/opacity_reg", opacity_reg_loss.item(), step)
                 if cfg.tb_save_image:
                     canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
                     canvas = canvas.reshape(-1, *canvas.shape[2:])
@@ -786,6 +848,12 @@ class Runner:
                 ) as f:
                     json.dump(stats, f)
                 data = {"step": step, "splats": self.splats.state_dict()}
+                # Also save hierarchical structure
+                data["levels"] = self.multigrid_gaussians.levels.cpu()
+                data["parent_indices"] = self.multigrid_gaussians.parent_indices.cpu()
+                data["level_indices"] = {
+                    k: v for k, v in self.multigrid_gaussians.level_indices.items()
+                }
                 if cfg.pose_opt:
                     if world_size > 1:
                         data["pose_adjust"] = self.pose_adjust.module.state_dict()
@@ -803,26 +871,29 @@ class Runner:
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
 
+                # Get splats with hierarchical structure applied
+                all_splats = self.multigrid_gaussians.get_splats(level=None)
+                
                 if self.cfg.app_opt:
                     # eval at origin to bake the appeareance into the colors
                     rgb = self.app_module(
-                        features=self.splats["features"],
+                        features=all_splats["features"],
                         embed_ids=None,
-                        dirs=torch.zeros_like(self.splats["means"][None, :, :]),
+                        dirs=torch.zeros_like(all_splats["means"][None, :, :]),
                         sh_degree=sh_degree_to_use,
                     )
-                    rgb = rgb + self.splats["colors"]
+                    rgb = rgb + all_splats["colors"]
                     rgb = torch.sigmoid(rgb).squeeze(0).unsqueeze(1)
                     sh0 = rgb_to_sh(rgb)
                     shN = torch.empty([sh0.shape[0], 0, 3], device=sh0.device)
                 else:
-                    sh0 = self.splats["sh0"]
-                    shN = self.splats["shN"]
+                    sh0 = all_splats["sh0"]
+                    shN = all_splats["shN"]
 
-                means = self.splats["means"]
-                scales = self.splats["scales"]
-                quats = self.splats["quats"]
-                opacities = self.splats["opacities"]
+                means = all_splats["means"]
+                scales = all_splats["scales"]
+                quats = all_splats["quats"]
+                opacities = all_splats["opacities"]
                 export_splats(
                     means=means,
                     scales=scales,
@@ -879,7 +950,24 @@ class Runner:
                 scheduler.step()
 
             # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, DefaultStrategy):
+            # After densification, update hierarchical structure in multigrid_gaussians
+            if isinstance(self.cfg.strategy, MultigridStrategy):
+                # Get visible_mask from info if available
+                visible_mask = info.get("visible_mask", None)
+                self.cfg.strategy.step_post_backward(
+                    params=self.splats,
+                    optimizers=self.optimizers,
+                    state=self.strategy_state,
+                    step=step,
+                    info=info,
+                    packed=cfg.packed,
+                    visible_mask=visible_mask,
+                )
+                # Update hierarchical structure from strategy state
+                self.multigrid_gaussians.levels = self.strategy_state["levels"]
+                self.multigrid_gaussians.parent_indices = self.strategy_state["parent_indices"]
+                self.multigrid_gaussians.level_indices = self.strategy_state["level_indices"]
+            elif isinstance(self.cfg.strategy, DefaultStrategy):
                 self.cfg.strategy.step_post_backward(
                     params=self.splats,
                     optimizers=self.optimizers,
@@ -900,14 +988,10 @@ class Runner:
             else:
                 assert_never(self.cfg.strategy)
 
-            # Measure metrics (lightweight, no image saving)
-            if cfg.metric_interval > 0 and step % cfg.metric_interval == 0:
-                self.measure_metric(step, stage="val")
-
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
                 self.eval(step)
-                self.render_traj(step)
+                # self.render_traj(step)
 
             # Save visualization images
             if cfg.visualization_interval > 0 and step % cfg.visualization_interval == 0:
@@ -931,119 +1015,33 @@ class Runner:
                 self.viewer.update(step, num_train_rays_per_step)
 
     @torch.no_grad()
-    def measure_metric(self, step: int, stage: str = "val") -> Dict[str, float]:
-        """Measure metrics only (no image saving).
-        
-        Renders and computes PSNR, SSIM, LPIPS metrics.
-        This is a lightweight function for frequent metric measurement during training.
-        
-        Args:
-            step: Current training step
-            stage: Evaluation stage name (e.g., "val", "test")
-        
-        Returns:
-            Dictionary with metric values (psnr, ssim, lpips, etc.)
-        """
-        cfg = self.cfg
-        device = self.device
-        world_rank = self.world_rank
-        world_size = self.world_size
-
-        valloader = torch.utils.data.DataLoader(
-            self.valset, batch_size=1, shuffle=False, num_workers=1
-        )
-        ellipse_time = 0
-        metrics = defaultdict(list)
-        
-        for i, data in enumerate(valloader):
-            camtoworlds = data["camtoworld"].to(device)
-            Ks = data["K"].to(device)
-            pixels = data["image"].to(device) / 255.0
-            masks = data["mask"].to(device) if "mask" in data else None
-            
-            height, width = pixels.shape[1:3]
-
-            torch.cuda.synchronize()
-            tic = time.time()
-            
-            colors, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                masks=masks,
-            )  # [1, H, W, 3]
-            torch.cuda.synchronize()
-            ellipse_time += max(time.time() - tic, 1e-10)
-
-            colors = torch.clamp(colors, 0.0, 1.0)
-
-            if world_rank == 0:
-                # Compute metrics
-                pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-                metrics["ssim"].append(self.ssim(colors_p, pixels_p))
-                metrics["lpips"].append(self.lpips(colors_p, pixels_p))
-                if cfg.use_bilateral_grid:
-                    cc_colors = color_correct(colors, pixels)
-                    cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                    metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
-                    metrics["cc_ssim"].append(self.ssim(cc_colors_p, pixels_p))
-                    metrics["cc_lpips"].append(self.lpips(cc_colors_p, pixels_p))
-        
-        # Compute average metrics
-        if world_rank == 0:
-            ellipse_time /= len(valloader)
-            
-            stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
-            stats.update(
-                {
-                    "ellipse_time": ellipse_time,
-                    "num_GS": len(self.splats["means"]),
-                }
-            )
-            
-            # Print metrics
-            if cfg.use_bilateral_grid:
-                print(
-                    f"Step {step} - Metrics: PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
-                    f"Number of GS: {stats['num_GS']}"
-                )
-            else:
-                print(
-                    f"Step {step} - Metrics: PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
-                    f"Number of GS: {stats['num_GS']}"
-                )
-            
-            # Save stats as json
-            with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
-                json.dump(stats, f)
-            
-            # Save stats to tensorboard
-            for k, v in stats.items():
-                self.writer.add_scalar(f"{stage}/{k}", v, step)
-            self.writer.flush()
-            
-            return stats
-        else:
-            return {}
-
-    @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
-        """Entry for evaluation."""
+        """Entry for evaluation.
+        
+        Renders at multiple LOD levels: highest LOD (level=-1) down to level 1,
+        decreasing by 2 levels each time. Metrics are computed using highest LOD only.
+        """
         print("Running evaluation...")
         cfg = self.cfg
         device = self.device
         world_rank = self.world_rank
         world_size = self.world_size
 
+        # Get max level for multi-level rendering
+        if len(self.multigrid_gaussians.levels) > 0:
+            max_level = int(self.multigrid_gaussians.levels.max().item())
+            # Generate level sequence: max_level, max_level-2, max_level-4, ..., down to at least level 1
+            levels_to_render = []
+            current_level = max_level
+            while current_level >= 1:
+                levels_to_render.append(current_level)
+                current_level -= 2
+            # If max_level is odd, also include level 1 if not already included
+            if levels_to_render[-1] > 1:
+                levels_to_render.append(1)
+        else:
+            levels_to_render = [1]
+
         valloader = torch.utils.data.DataLoader(
             self.valset, batch_size=1, shuffle=False, num_workers=1
         )
@@ -1052,37 +1050,89 @@ class Runner:
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
-            pixels = data["image"].to(device) / 255.0
+            image_data = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
+            
+            # Handle RGBA images: extract RGB and alpha separately
+            if image_data.shape[-1] == 4:
+                pixels = image_data[..., :3]  # [1, H, W, 3]
+            else:
+                pixels = image_data  # [1, H, W, 3]
+            
             height, width = pixels.shape[1:3]
 
             torch.cuda.synchronize()
             tic = time.time()
-            colors, _, _ = self.rasterize_splats(
+            # Prepare backgrounds if needed
+            # backgrounds shape should be [..., C, D] where C is number of cameras, D is channels
+            # For camtoworlds shape [1, 4, 4], C=1, so backgrounds should be [1, 3]
+            backgrounds = None
+            if cfg.white_background:
+                backgrounds = torch.ones(1, 3, device=device)  # [C=1, 3] for white background
+            
+            # Render at highest LOD for metrics
+            colors, alphas, _ = self.multigrid_gaussians.rasterize_splats(
                 camtoworlds=camtoworlds,
                 Ks=Ks,
                 width=width,
                 height=height,
+                level=-1,  # Highest LOD for metrics
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 masks=masks,
-            )  # [1, H, W, 3]
+                packed=cfg.packed,
+                sparse_grad=cfg.sparse_grad,
+                distributed=world_size > 1,
+                camera_model=cfg.camera_model,
+                backgrounds=backgrounds,  # Pass backgrounds to rasterization
+            )  # colors: [1, H, W, 3], alphas: [1, H, W, 1]
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
-            canvas_list = [pixels, colors]
-
+            
+            # For saving images: render at multiple levels and concatenate
             if world_rank == 0:
-                # write images
-                canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
+                level_images = [pixels[0].cpu().numpy()]  # Start with GT
+                
+                # Prepare backgrounds if needed
+                # backgrounds shape should be [..., C, D] where C is number of cameras, D is channels
+                # For camtoworlds shape [1, 4, 4], C=1, so backgrounds should be [1, 3]
+                backgrounds = None
+                if cfg.white_background:
+                    backgrounds = torch.ones(1, 3, device=device)  # [C=1, 3] for white background
+                
+                for render_level in levels_to_render:
+                    colors_level, alphas_level, _ = self.multigrid_gaussians.rasterize_splats(
+                        camtoworlds=camtoworlds,
+                        Ks=Ks,
+                        width=width,
+                        height=height,
+                        level=render_level,
+                        sh_degree=cfg.sh_degree,
+                        near_plane=cfg.near_plane,
+                        far_plane=cfg.far_plane,
+                        masks=masks,
+                        packed=cfg.packed,
+                        sparse_grad=cfg.sparse_grad,
+                        distributed=world_size > 1,
+                        camera_model=cfg.camera_model,
+                        backgrounds=backgrounds,  # Pass backgrounds to rasterization
+                    )  # colors_level: [1, H, W, 3], alphas_level: [1, H, W, 1]
+                    colors_level = colors_level[0]  # [H, W, 3]
+                    colors_level = torch.clamp(colors_level, 0.0, 1.0).cpu().numpy()
+                    level_images.append(colors_level)
+                
+                # Concatenate horizontally: [H, (num_levels+1)*W, 3]
+                canvas = np.concatenate(level_images, axis=1)
                 canvas = (canvas * 255).astype(np.uint8)
                 imageio.imwrite(
                     f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
                     canvas,
                 )
 
+                # Compute metrics using highest LOD only
                 pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
                 metrics["psnr"].append(self.psnr(colors_p, pixels_p))
@@ -1128,7 +1178,11 @@ class Runner:
 
     @torch.no_grad()
     def save_visualization(self, step: int):
-        """Save visualization images comparing GT and render from sampled cameras."""
+        """Save visualization images comparing GT and render from sampled cameras.
+        
+        Renders at multiple LOD levels: highest LOD (level=-1) down to level 1,
+        decreasing by 2 levels each time. All renders are concatenated horizontally.
+        """
         if self.world_rank != 0:
             return
         
@@ -1137,6 +1191,24 @@ class Runner:
         
         cfg = self.cfg
         device = self.device
+        
+        # Check if we have any GSs
+        if len(self.multigrid_gaussians.levels) == 0:
+            return
+        
+        # Get max level
+        max_level = int(self.multigrid_gaussians.levels.max().item())
+        
+        # Generate level sequence: max_level, max_level-2, max_level-4, ..., down to at least level 1
+        levels_to_render = []
+        current_level = max_level
+        while current_level >= 1:
+            levels_to_render.append(current_level)
+            current_level -= 1
+        
+        # If max_level is odd, also include level 1 if not already included
+        if levels_to_render[-1] > 1:
+            levels_to_render.append(1)
         
         viz_dir = f"{cfg.result_dir}/visualizations"
         os.makedirs(viz_dir, exist_ok=True)
@@ -1158,29 +1230,43 @@ class Runner:
             
             height, width = pixels_gt.shape[:2]
             
-            # Render
-            colors, _, _ = self.rasterize_splats(
-                camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                sh_degree=cfg.sh_degree,
-                near_plane=cfg.near_plane,
-                far_plane=cfg.far_plane,
-                masks=masks,
-            )  # [1, H, W, 3]
-            colors = colors[0]  # [H, W, 3]
-            colors = torch.clamp(colors, 0.0, 1.0)
+            # Prepare backgrounds if needed
+            # backgrounds shape should be [..., C, D] where C is number of cameras, D is channels
+            # For camtoworlds shape [1, 4, 4], C=1, so backgrounds should be [1, 3]
+            backgrounds = None
+            if cfg.white_background:
+                backgrounds = torch.ones(1, 3, device=device)  # [C=1, 3] for white background
             
-            # Convert to numpy and stack: [H, W, 3] for GT, [H, W, 3] for render
-            pixels_gt_np = pixels_gt.cpu().numpy()
-            colors_np = colors.cpu().numpy()
+            # Render at each level and concatenate horizontally
+            level_images = [pixels_gt.cpu().numpy()]  # Start with GT
             
-            # Stack horizontally: [H, 2*W, 3]
-            combined = np.concatenate([pixels_gt_np, colors_np], axis=1)
+            for render_level in levels_to_render:
+                colors, alphas, _ = self.multigrid_gaussians.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks,
+                    width=width,
+                    height=height,
+                    level=render_level,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    masks=masks,
+                    packed=cfg.packed,
+                    sparse_grad=cfg.sparse_grad,
+                    distributed=self.world_size > 1,
+                    camera_model=cfg.camera_model,
+                    backgrounds=backgrounds,  # Pass backgrounds to rasterization
+                )  # colors: [1, H, W, 3], alphas: [1, H, W, 1]
+                colors = colors[0]  # [H, W, 3]
+                colors = torch.clamp(colors, 0.0, 1.0)
+                colors_np = colors.cpu().numpy()
+                level_images.append(colors_np)
+            
+            # Stack horizontally: [H, (num_levels+1)*W, 3]
+            combined = np.concatenate(level_images, axis=1)
             images_list.append(combined)
         
-        # Stack vertically: [3*H, 2*W, 3]
+        # Stack vertically: [num_cameras*H, (num_levels+1)*W, 3]
         if len(images_list) > 0:
             final_image = np.concatenate(images_list, axis=0)
             
@@ -1188,7 +1274,7 @@ class Runner:
             final_image_uint8 = (final_image * 255).astype(np.uint8)
             viz_path = f"{viz_dir}/viz_step_{step:06d}.jpg"
             imageio.imwrite(viz_path, final_image_uint8, format='jpg', quality=95)
-            print(f"  Saved visualization to {viz_path}")
+            print(f"  Saved visualization to {viz_path} (levels: {levels_to_render})")
 
     @torch.no_grad()
     def render_traj(self, step: int):
@@ -1268,6 +1354,7 @@ class Runner:
     def run_compression(self, step: int):
         """Entry for running compression."""
         print("Running compression...")
+        cfg = self.cfg
         world_rank = self.world_rank
 
         compress_dir = f"{cfg.result_dir}/compression/rank{world_rank}"
@@ -1371,6 +1458,11 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         ]
         for k in runner.splats.keys():
             runner.splats[k].data = torch.cat([ckpt["splats"][k] for ckpt in ckpts])
+        # Load hierarchical structure if available
+        if "levels" in ckpts[0]:
+            runner.multigrid_gaussians.levels = ckpts[0]["levels"].to(runner.device)
+            runner.multigrid_gaussians.parent_indices = ckpts[0]["parent_indices"].to(runner.device)
+            runner.multigrid_gaussians.level_indices = ckpts[0]["level_indices"]
         step = ckpts[0]["step"]
         runner.eval(step=step)
         runner.render_traj(step=step)
@@ -1391,24 +1483,26 @@ if __name__ == "__main__":
 
     ```bash
     # Single GPU training
-    CUDA_VISIBLE_DEVICES=9 python -m examples.simple_trainer default
+    CUDA_VISIBLE_DEVICES=9 python hierarchical_trainer.py default
 
     # Distributed training on 4 GPUs: Effectively 4x batch size so run 4x less steps.
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python simple_trainer.py default --steps_scaler 0.25
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python hierarchical_trainer.py default --steps_scaler 0.25
 
+    ```
     """
 
     # Config objects we can choose between.
     # Each is a tuple of (CLI description, config object).
     configs = {
         "default": (
-            "Gaussian splatting training using densification heuristics from the original paper.",
+            "Hierarchical Gaussian splatting training using multigrid densification strategy.",
             Config(
-                strategy=DefaultStrategy(verbose=True),
+                strategy=MultigridStrategy(verbose=True),
+                opacity_reg=0.01,  # Opacity regularization for visible gaussians
             ),
         ),
         "mcmc": (
-            "Gaussian splatting training using densification from the paper '3D Gaussian Splatting as Markov Chain Monte Carlo'.",
+            "Hierarchical Gaussian splatting training using densification from the paper '3D Gaussian Splatting as Markov Chain Monte Carlo'.",
             Config(
                 init_opa=0.5,
                 init_scale=0.1,
@@ -1456,3 +1550,4 @@ if __name__ == "__main__":
         assert cfg.with_eval3d, "Training with UT requires setting `with_eval3d` flag."
 
     cli(main, cfg, verbose=True)
+

@@ -15,7 +15,8 @@ import tqdm
 import tyro
 import viser
 import yaml
-from datasets.colmap import Dataset, Parser
+from datasets.colmap import Dataset as ColmapDataset, Parser as ColmapParser
+from datasets.nerf import Dataset as NerfDataset, Parser as NerfParser
 from datasets.traj import (
     generate_ellipse_path_z,
     generate_interpolated_path,
@@ -40,10 +41,13 @@ from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 
+opacity_grad_norms = []
+
+
 @dataclass
 class Config:
     # Disable viewer
-    disable_viewer: bool = False
+    disable_viewer: bool = True
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
     # Name of compression strategy to use
@@ -51,12 +55,18 @@ class Config:
     # Render trajectory path
     render_traj_path: str = "interp"
 
-    # Path to the Mip-NeRF 360 dataset
-    data_dir: str = "data/360_v2/garden"
+    # Dataset type: "colmap" or "nerf"
+    dataset_type: Literal["colmap", "nerf"] = "colmap"
+    # Path to the dataset directory
+    data_dir: Optional[str] = None
+    # Directory to save results (if None, auto-generated from data_dir)
+    result_dir: Optional[str] = None
     # Downsample factor for the dataset
     data_factor: int = 4
-    # Directory to save results
-    result_dir: str = "results/garden"
+    # For NeRF datasets: use white background for RGBA images
+    white_background: bool = False
+    # For NeRF datasets: image file extension
+    image_extension: str = ".png"
     # Every N images there is a test image
     test_every: int = 8
     # Random crop size for training  (experimental)
@@ -64,7 +74,7 @@ class Config:
     # A global scaler that applies to the scene size related parameters
     global_scale: float = 1.0
     # Normalize the world space
-    normalize_world_space: bool = True
+    normalize_world_space: bool = False
     # Camera model
     camera_model: Literal["pinhole", "ortho", "fisheye"] = "pinhole"
 
@@ -192,6 +202,38 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
+    def __post_init__(self):
+        """Auto-generate result_dir if not provided."""
+        from pathlib import Path
+        
+        if self.data_dir is None:
+            if self.dataset_type == "colmap":
+                self.data_dir = "data/360_v2/garden"
+            elif self.dataset_type == "nerf":
+                self.data_dir = "data/nerf/lego"
+            else:
+                raise ValueError(f"Unknown dataset_type: {self.dataset_type}")
+        
+        # Always regenerate result_dir to ensure it matches current CLI arguments
+        # (e.g., if data_factor was changed via CLI, result_dir should reflect that)
+        # Extract dataset name from data_dir (last directory component)
+        dataset_name = Path(self.data_dir).name
+        
+        # Build settings string
+        settings_parts = [
+            f"type_{self.dataset_type}",
+            f"factor_{self.data_factor}",
+        ]
+        if self.dataset_type == "nerf" and self.white_background:
+            settings_parts.append("whitebg")
+        if self.normalize_world_space:
+            settings_parts.append("norm")
+        if self.patch_size is not None:
+            settings_parts.append(f"patch_{self.patch_size}")
+        
+        settings_str = "_".join(settings_parts)
+        self.result_dir = f"/Bean/log/gwangjin/2025/gsplat/baseline/{dataset_name}_{settings_str}"
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -214,7 +256,7 @@ class Config:
 
 
 def create_splats_with_optimizers(
-    parser: Parser,
+    parser: Union[ColmapParser, NerfParser],
     init_type: str = "sfm",
     init_num_pts: int = 100_000,
     init_extent: float = 3.0,
@@ -313,7 +355,7 @@ class Runner:
         self, local_rank: int, world_rank, world_size: int, cfg: Config
     ) -> None:
         set_random_seed(42 + local_rank)
-
+        print(cfg)
         self.cfg = cfg
         self.world_rank = world_rank
         self.local_rank = local_rank
@@ -337,19 +379,38 @@ class Runner:
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
         # Load data: Training data should contain initial points and colors.
-        self.parser = Parser(
-            data_dir=cfg.data_dir,
-            factor=cfg.data_factor,
-            normalize=cfg.normalize_world_space,
-            test_every=cfg.test_every,
-        )
-        self.trainset = Dataset(
-            self.parser,
-            split="train",
-            patch_size=cfg.patch_size,
-            load_depths=cfg.depth_loss,
-        )
-        self.valset = Dataset(self.parser, split="val")
+        if cfg.dataset_type == "colmap":
+            self.parser = ColmapParser(
+                data_dir=cfg.data_dir,
+                factor=cfg.data_factor,
+                normalize=cfg.normalize_world_space,
+                test_every=cfg.test_every,
+            )
+            self.trainset = ColmapDataset(
+                self.parser,
+                split="train",
+                patch_size=cfg.patch_size,
+                load_depths=cfg.depth_loss,
+            )
+            self.valset = ColmapDataset(self.parser, split="val")
+        elif cfg.dataset_type == "nerf":
+            self.parser = NerfParser(
+                data_dir=cfg.data_dir,
+                factor=cfg.data_factor,
+                normalize=cfg.normalize_world_space,
+                test_every=cfg.test_every,
+                white_background=cfg.white_background,
+                extension=cfg.image_extension,
+            )
+            self.trainset = NerfDataset(
+                self.parser,
+                split="train",
+                patch_size=cfg.patch_size,
+                load_depths=cfg.depth_loss,
+            )
+            self.valset = NerfDataset(self.parser, split="val")
+        else:
+            raise ValueError(f"Unknown dataset type: {cfg.dataset_type}")
         
         # Sample 3 cameras from test set for visualization
         if cfg.visualization_interval > 0:
@@ -534,6 +595,7 @@ class Runner:
             rasterize_mode = "antialiased" if self.cfg.antialiased else "classic"
         if camera_model is None:
             camera_model = self.cfg.camera_model
+
         render_colors, render_alphas, info = rasterization(
             means=means,
             quats=quats,
@@ -859,6 +921,8 @@ class Runner:
                 else:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
+            opacity_grad_norms.append(self.splats["opacities"].grad.norm().item())
+
             # optimize
             for optimizer in self.optimizers.values():
                 if cfg.visible_adam:
@@ -866,6 +930,7 @@ class Runner:
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                
             for optimizer in self.pose_optimizers:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -1360,7 +1425,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
         cfg.disable_viewer = True
         if world_rank == 0:
             print("Viewer is disabled in distributed training.")
-
+    print(cfg)
     runner = Runner(local_rank, world_rank, world_size, cfg)
 
     if cfg.ckpt is not None:
@@ -1419,6 +1484,9 @@ if __name__ == "__main__":
         ),
     }
     cfg = tyro.extras.overridable_config_cli(configs)
+    # Manually call __post_init__ after CLI parsing to ensure result_dir and data_dir
+    # are auto-generated with the correct CLI-provided values (e.g., data_factor)
+    cfg.__post_init__()
     cfg.adjust_steps(cfg.steps_scaler)
 
     # Import BilateralGrid and related functions based on configuration

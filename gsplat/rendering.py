@@ -607,6 +607,13 @@ def rasterization(
         # make it apple-to-apple with Inria's CUDA Backend.
         colors = torch.clamp_min(colors + 0.5, 0.0)
 
+
+    meta.update(
+        {
+            "colors": colors,
+        }
+    )
+
     # If in distributed mode, we need to scatter the GSs to the destination ranks, based
     # on which cameras they are visible to, which we already figured out in the projection
     # stage.
