@@ -578,6 +578,22 @@ class Runner:
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        plt.figure()
+        plt.hist(opacities.cpu().data.numpy(), bins=100)
+        plt.savefig("opacities_simple.png")
+        plt.close()
+
+        #make histogram of scales
+        plt.figure()
+        plt.hist(scales.cpu().data.numpy(), bins=100)
+        plt.savefig("scales_simple.png")
+        plt.close()
+
+        exit()
+
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
             colors = self.app_module(
@@ -967,7 +983,7 @@ class Runner:
 
             # Measure metrics (lightweight, no image saving)
             if cfg.metric_interval > 0 and step % cfg.metric_interval == 0:
-                self.measure_metric(step, stage="val")
+                self.measure_metric(step, stage="val", global_tic=global_tic)
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
@@ -996,7 +1012,7 @@ class Runner:
                 self.viewer.update(step, num_train_rays_per_step)
 
     @torch.no_grad()
-    def measure_metric(self, step: int, stage: str = "val") -> Dict[str, float]:
+    def measure_metric(self, step: int, stage: str = "val", global_tic: Optional[float] = None) -> Dict[str, float]:
         """Measure metrics only (no image saving).
         
         Renders and computes PSNR, SSIM, LPIPS metrics.
@@ -1005,6 +1021,7 @@ class Runner:
         Args:
             step: Current training step
             stage: Evaluation stage name (e.g., "val", "test")
+            global_tic: Global start time for training (to measure total training time)
         
         Returns:
             Dictionary with metric values (psnr, ssim, lpips, etc.)
@@ -1071,6 +1088,8 @@ class Runner:
                     "num_GS": len(self.splats["means"]),
                 }
             )
+            if global_tic is not None:
+                stats["ellipse_time"] = time.time() - global_tic
             
             # Print metrics
             if cfg.use_bilateral_grid:

@@ -231,7 +231,7 @@ class DefaultStrategy(Strategy):
         if state["grad2d"] is None:
             state["grad2d"] = torch.zeros(n_gaussian, device=grads.device)
         if state["count"] is None:
-            state["count"] = torch.zeros(n_gaussian, device=grads.device)
+            state["count"] = torch.zeros(n_gaussian, dtype=torch.float32, device=grads.device)
         if self.refine_scale2d_stop_iter > 0 and state["radii"] is None:
             assert "radii" in info, "radii is required but missing."
             state["radii"] = torch.zeros(n_gaussian, device=grads.device)

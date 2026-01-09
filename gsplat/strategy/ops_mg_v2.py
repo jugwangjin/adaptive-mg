@@ -136,6 +136,8 @@ def duplicate(
         multigrid_gaussians.levels = new_levels
         multigrid_gaussians.parent_indices = new_parent_indices
         multigrid_gaussians.level_indices = level_indices_new
+        # Invalidate cache after densification
+        multigrid_gaussians.invalidate_splats_cache()
 
 
 @torch.no_grad()
@@ -174,7 +176,7 @@ def split(
     def param_fn(name: str, p: Tensor) -> Tensor:
         if name == "scales":
             # Scale reduced by -0.5 (modify original and copy)
-            p[sel] -= 1.6
+            p[sel] -= 0.6931 
             # p[sel] = p[sel].mean(dim=-1, keepdim=True).repeat(1, 3)
             p_split = p[sel]
         # elif name == "opacities":
@@ -233,6 +235,8 @@ def split(
         multigrid_gaussians.levels = new_levels
         multigrid_gaussians.parent_indices = new_parent_indices
         multigrid_gaussians.level_indices = level_indices_new
+        # Invalidate cache after densification
+        multigrid_gaussians.invalidate_splats_cache()
 
 
 @torch.no_grad()
@@ -327,6 +331,8 @@ def remove_mg(
         multigrid_gaussians.levels = new_levels
         multigrid_gaussians.parent_indices = new_parent_indices
         multigrid_gaussians.level_indices = level_indices_new
+        # Invalidate cache after densification
+        multigrid_gaussians.invalidate_splats_cache()
 
 
 @torch.no_grad()
@@ -372,15 +378,15 @@ def create_children_mg(
             return  # No valid parents to create children for
     
     # Now process with validated sel
-    # Get actual scales (with hierarchical structure applied) instead of residual scales
-    # This ensures children are initialized relative to parent's actual scale, not residual scale
+    # All parameters are now residual, so we need parent's actual values for initialization
     multigrid_gaussians = state.get("multigrid_gaussians", None)
 
     # Get actual splats for parents to get their actual scales, quats, and opacities
-    # scales, quats, opacities are independent parameters, so we use parent's actual values
+    # All parameters are residual, so we use parent's actual values for initialization
     # No gradients needed for initialization
+    # Always use current splats (no caching)
     with torch.no_grad():
-        parent_actual_splats = multigrid_gaussians.get_splats(level=None, detach_parents=False)
+        parent_actual_splats = multigrid_gaussians.get_splats(level=None, detach_parents=False, current_splats=None)
         parent_actual_scales = parent_actual_splats["scales"][sel]  # [len(sel), 3] - actual scales in log space
         parent_actual_quats = parent_actual_splats["quats"][sel]  # [len(sel), 4] - actual quaternions
         parent_actual_opacities = parent_actual_splats["opacities"][sel]  # [len(sel),] - actual opacities in logit space
@@ -416,27 +422,19 @@ def create_children_mg(
             # Small random offset helps children explore nearby space while staying close to parent
             p_split = samples.reshape(-1, 3)  # [n_children_per_split*N, 3] - residual only
         elif name == "scales":
-            # Initialize as independent parameter: parent_actual_scale - 1.4 (in log space)
-            # Child scale = parent_actual_scale_log - 1.4
-            parent_scales_log = parent_actual_scales  # [len(sel), 3] - already in log space
-            child_scales_log = parent_scales_log - 1.6  # [len(sel), 3]
-            # child_scales_log = child_scales_log.mean(dim=-1, keepdim=True).repeat(1, 3)
-            # Expand to [n_children_per_split * len(sel), 3] - same for all children of each parent
-            p_split = child_scales_log.repeat_interleave(n_children_per_split, dim=0)  # [n_children_per_split * len(sel), 3]
+            # Initialize as residual: 0 (in log space)
+            # Child scale = parent_scale + 0 - 0.6931 = parent_scale - 0.6931
+            # This makes child scale approximately 50% of parent (exp(-0.6931) ≈ 0.5)
+            p_split = torch.zeros((n_children_per_split * len(sel), 3), device=device, dtype=p.dtype)
         elif name == "quats":
-            # Initialize as independent parameter: same as parent (parent's actual quats)
-            # Child quats = parent_actual_quats
-            # Expand to [n_children_per_split * len(sel), 4] - same for all children of each parent
-            p_split = parent_actual_quats.repeat_interleave(n_children_per_split, dim=0)  # [n_children_per_split * len(sel), 4]
+            # Initialize as residual: identity quaternion [1, 0, 0, 0]
+            # Child quat = parent_quat * identity = parent_quat (no rotation change)
+            identity_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device, dtype=p.dtype)  # [4] - identity quaternion
+            p_split = identity_quat.unsqueeze(0).repeat(n_children_per_split * len(sel), 1)  # [n_children_per_split * len(sel), 4]
         elif name == "opacities":
-            # Initialize as independent parameter using revised_opacity formula
-            # Child opacity = 1.0 - sqrt(1.0 - parent_actual_opacity)
-            # This ensures child opacity is lower than parent while maintaining distribution
-            parent_actual_opacities_sigmoid = torch.sigmoid(parent_actual_opacities)  # [len(sel),]
-            # Apply revised_opacity formula: 1.0 - sqrt(1.0 - parent_opacity)
-            child_opacities_sigmoid = 1.0 - torch.sqrt(1.0 - parent_actual_opacities_sigmoid)
-            # Convert back to logit space and expand for all children
-            p_split = torch.logit(child_opacities_sigmoid).repeat_interleave(n_children_per_split, dim=0)  # [n_children_per_split * len(sel),]
+            # Initialize as residual: 0
+            # Child opacity = parent_opacity + 0 = parent_opacity
+            p_split = torch.zeros((n_children_per_split * len(sel),), device=device, dtype=p.dtype)
         else:
             # For other parameters (sh0, shN, etc.), initialize to zero (residual)
             p_split = torch.zeros((n_children_per_split * len(sel), *p.shape[1:]), device=device, dtype=p.dtype)
@@ -496,6 +494,8 @@ def create_children_mg(
         multigrid_gaussians.levels = new_levels
         multigrid_gaussians.parent_indices = new_parent_indices
         multigrid_gaussians.level_indices = level_indices_new
+        # Invalidate cache after densification
+        multigrid_gaussians.invalidate_splats_cache()
 
 
 @torch.no_grad()
@@ -507,22 +507,37 @@ def reset_opa_mg(
 ):
     """Inplace reset the opacities to the given post-sigmoid value (multigrid version).
     
-    For multigrid_v4.py, opacities are independent parameters (not residual).
-    Reset all opacities to the same value regardless of level.
+    For multigrid_v6.py, opacities are residual parameters.
+    - Level 1: Reset to target value (absolute value)
+    - Level 2+: Reset to 0 (residual, so they inherit parent's opacity)
 
     Args:
         params: A dictionary of parameters.
         optimizers: A dictionary of optimizers, each corresponding to a parameter.
         state: State dictionary containing hierarchical structure (levels, parent_indices, level_indices).
-        value: The value to reset the opacities (post-sigmoid, e.g., 0.01).
+        value: The value to reset Level 1 opacities (post-sigmoid, e.g., 0.01).
     """
+    levels = state.get("levels", None)
+    if levels is None:
+        raise ValueError("levels not found in state. Cannot reset opacities by level.")
+    
     def param_fn(name: str, p: Tensor) -> Tensor:
         if name == "opacities":
-            # Target value in logit space
-            target_val = torch.logit(torch.tensor(value)).item()
+            # Target value in logit space for Level 1
+            target_val = torch.logit(torch.tensor(value, device=p.device, dtype=p.dtype))
             
-            # Reset all opacities to target value (independent parameter, same for all levels)
-            new_opacities = torch.clamp(p, max=target_val)
+            # Create new opacities tensor
+            new_opacities = p.clone()
+            
+            # Level 1: Reset to target value (absolute value)
+            level1_mask = (levels == 1)
+            if level1_mask.any():
+                new_opacities[level1_mask] = torch.clamp(p[level1_mask], max=target_val)
+            
+            # Level 2+: Reset to 0 (residual, so they inherit parent's opacity)
+            level2plus_mask = (levels > 1)
+            if level2plus_mask.any():
+                new_opacities[level2plus_mask] = 0.0
             
             return torch.nn.Parameter(new_opacities, requires_grad=p.requires_grad)
         else:

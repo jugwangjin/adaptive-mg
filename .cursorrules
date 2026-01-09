@@ -1,0 +1,15 @@
+# Project Rules for Adaptive Multigrid Gaussian Splatting
+
+## Strategy Usage
+
+- **Primary Strategy**: This project uses `gsplat/strategy/multigrid_v4.py` as the default strategy for `vcycle_trainer.py`. This is the main strategy being actively developed and used.
+
+- **Other Strategies**: Other strategy files (multigrid_v2.py, multigrid_v3.py, multigrid.py, etc.) are not currently in use and should not be considered unless explicitly mentioned.
+
+- **Baseline Strategy**: `gsplat/strategy/default.py` is kept for baseline comparison purposes only. Unless explicitly mentioned, it should not be considered when making changes or suggestions.
+
+## General Development Guidelines
+
+- Exception handling: Do not add exception handling unless explicitly requested by the user.
+- Import error handling: Do not add exception handling for import failures unless explicitly requested by the user.
+

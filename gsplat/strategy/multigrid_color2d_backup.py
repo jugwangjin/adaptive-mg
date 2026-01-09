@@ -544,7 +544,7 @@ class MultigridStrategy(Strategy):
                 levels=levels,
                 parent_indices=parent_indices,
                 level_indices=level_indices,
-                n_children=self.n_children_per_split,
+                n_children_per_split=self.n_children_per_split,
             )
         
         return n_dupli, n_split, n_create_children
@@ -623,9 +623,6 @@ class MultigridStrategy(Strategy):
                 optimizers=optimizers,
                 state=state,
                 mask=final_prune_mask,
-                levels=state["levels"],
-                parent_indices=state["parent_indices"],
-                level_indices=state["level_indices"],
             )
 
         return n_prune

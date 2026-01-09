@@ -2,7 +2,7 @@ comparison_graphs/
 reference_codes/
 @eaDir/
 Thumbs.db
-
+tmp/
 
 .clangd
 compile_commands.json

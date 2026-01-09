@@ -1,3 +1,49 @@
+"""
+vcycle_trainer_v6.py - Multigrid V-cycle Trainer with Residual Equation
+
+VERSION HISTORY AND KEY DIFFERENCES:
+
+v6 (Current):
+    - **Multigrid Residual Equation Implementation**: 
+      * Core multigrid concept: solve residual equation at coarse level
+      * residual_color = render_current - GT (computed in _train_step)
+      * residual_target = GT - render_finer (computed in _train_step)
+      * Loss: ||residual_color + residual_target|| = ||(render_current - GT) + (GT - render_finer)||
+      * This ensures render_current matches render_finer (multigrid goal)
+    
+    - **Residual Calculation in _train_step**:
+      * Finer level rendering happens inside _train_step (view changes every step)
+      * residual_target computed per training step, not per smoothing step
+      * Properly handles view-dependent residual calculation
+    
+    - **Refactored Restriction Logic**:
+      * Uses MultigridGaussians.restrict_parameters() helper function
+      * Cleaner code with proper handling of:
+        - means: scaling with position_scale_reduction
+        - scales: -1.4 offset handling
+        - quats: quaternion multiplication
+        - other params: simple addition
+    
+    - **All Parameters are Residual**:
+      * means, scales, quats, opacities, sh0, shN all use residual formulation
+      * Child = parent + residual (with special handling for means/scales/quats)
+    
+    - **multigrid_gaussians_v2**: Uses v2 with helper functions for parent<->child conversion
+    
+    - **Result Directory**: Includes "v6" and "randbkgd" flag in path
+
+v5 (Previous):
+    - Used simple GT loss even for non-finest levels
+    - Residual calculation was done outside _train_step (incorrect for view changes)
+    - Restriction logic was verbose and repetitive
+    - May have had some parameters as independent rather than residual
+
+v4 and earlier:
+    - Basic V-cycle implementation
+    - May have had different parameter handling
+    - Different restriction/prolongation strategies
+"""
+
 import json
 import math
 import os
@@ -36,10 +82,10 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-from gsplat.strategy.multigrid_v4 import MultigridStrategy
+from gsplat.strategy.multigrid_v6 import MultigridStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
-from multigrid_gaussians import MultigridGaussians
+from multigrid_gaussians_v2 import MultigridGaussians, quaternion_multiply
 
 opacity_grad_norms = []
 
@@ -130,7 +176,7 @@ class Config:
     packed: bool = False
     
     # Multigrid growth control parameters (passed to MultigridStrategy)
-    max_children_per_parent: int = 50  # Maximum number of children a parent can have
+    max_children_per_parent: int = 20  # Maximum number of children a parent can have
     grad_threshold_decay_rate: float = 0.9  # Decay rate for gradient threshold per level
     # Use sparse gradients for optimization. (experimental)
     sparse_grad: bool = False
@@ -259,10 +305,12 @@ class Config:
             settings_parts = [
                 f"type_{self.dataset_type}",
                 f"factor_{self.data_factor}",
-                "v1",
+                "v6",
             ]
             if self.dataset_type == "nerf" and self.white_background:
                 settings_parts.append("whitebg")
+            if self.random_bkgd:
+                settings_parts.append("randbkgd")
             if self.normalize_world_space:
                 settings_parts.append("norm")
             if self.patch_size is not None:
@@ -337,6 +385,7 @@ def vcycle_recursive(
     pbar: Optional[tqdm.tqdm] = None,
     vcycle_idx: int = 0,
     losses: Optional[List[float]] = None,
+    global_tic: Optional[float] = None,
 ) -> Tuple[int, List[float]]:
     """
     Recursive V-cycle: max_level -> coarsest_level -> max_level.
@@ -387,6 +436,7 @@ def vcycle_recursive(
                 step=log_step,
                 data=data,
                 target_level=level,
+                global_tic=global_tic,
             )
             losses.append(loss)
             
@@ -446,15 +496,18 @@ def vcycle_recursive(
     
     # Get initial hierarchical values for valid gaussians
     # No gradients needed for restriction (only parameter updates)
+    # Always use current optimized splats (cache is just a hint, computation uses current values)
     with torch.no_grad():
-        initial_splats = runner.multigrid_gaussians.get_splats(level=None, detach_parents=True)
-        initial_means = initial_splats["means"][valid_indices].clone().detach()  # [K, 3]
-        initial_sh0 = initial_splats["sh0"][valid_indices].clone().detach()  # [K, 1, 3]
-        initial_shN = initial_splats["shN"][valid_indices].clone().detach()  # [K, K, 3]
+        # Pass current_splats=None to use self.splats (which contains current optimized values)
+        initial_splats = runner.multigrid_gaussians.get_splats(level=None, detach_parents=True, current_splats=None)
+        # Store initial values in dict
+        param_keys = ["means", "scales", "quats", "sh0", "shN", "opacities"]
+        initial_params = {key: initial_splats[key][valid_indices].clone().detach() for key in param_keys}
         # Free initial_splats immediately after extracting needed values
         del initial_splats
     
     # Smoothing steps at current level
+    # Residual calculation is now done inside _train_step (view changes every step)
     for smoothing_step in range(smoothing_steps):
         # Continue V-cycle even if max_steps is reached (complete the cycle)
         try:
@@ -469,6 +522,7 @@ def vcycle_recursive(
             step=log_step,
             data=data,
             target_level=target_level,
+            global_tic=global_tic,
         )
         losses.append(loss)
         
@@ -489,70 +543,63 @@ def vcycle_recursive(
     # Use no_grad to prevent computation graph accumulation in recursive calls
     with torch.no_grad():
         # Get final hierarchical values after smoothing
-        final_splats = runner.multigrid_gaussians.get_splats(level=None, detach_parents=True)
-        final_means = final_splats["means"][valid_indices]  # [K, 3]
-        final_sh0 = final_splats["sh0"][valid_indices]  # [K, 1, 3]
-        final_shN = final_splats["shN"][valid_indices]  # [K, K, 3]
-        # Free final_splats immediately after extracting needed values
+        # Always use current optimized splats (no caching during optimization)
+        final_splats = runner.multigrid_gaussians.get_splats(level=None, detach_parents=True, current_splats=None)
+        
+        # Calculate changes (delta) for all residual parameters
+        # All parameters are now residual: means, scales, quats, opacities, sh0, shN
+        child_deltas = {}
+        for key in param_keys:
+            child_deltas[key] = final_splats[key][valid_indices] - initial_params[key]
+        
+        # Free intermediate tensors
         del final_splats
         
-        # Calculate changes (delta) for residual parameters only
-        # Residual parameters (means, sh0, shN) have prolongation (parent + child residual),
-        # so restriction (fine->coarse) is also defined for them.
-        # Independent parameters (quats, scales, opacities) have no prolongation,
-        # so restriction is not applicable.
-        delta_means = final_means - initial_means  # [K, 3]
-        delta_sh0 = final_sh0 - initial_sh0  # [K, 1, 3]
-        delta_shN = final_shN - initial_shN  # [K, K, 3]
-        
-        # Get parent indices for valid gaussians
+        # Get parent indices and child levels for valid gaussians
         valid_parent_indices = parent_indices[valid_indices]  # [K,]
+        valid_child_levels = runner.multigrid_gaussians.levels[valid_indices]  # [K,]
+        valid_parent_levels = runner.multigrid_gaussians.levels[valid_parent_indices]  # [K,]
         
-        N = len(runner.multigrid_gaussians.levels)
+        # Use restrict_parameters helper function
+        # Note: parent_level = child_level - 1 (always), so we don't need to pass parent_levels
+        parent_deltas = MultigridGaussians.restrict_parameters(
+            child_params=child_deltas,
+            parent_indices=valid_parent_indices,
+            child_levels=valid_child_levels,
+            position_scale_reduction=runner.multigrid_gaussians.position_scale_reduction,
+            parent_levels=valid_parent_levels,
+        )
         
-        # Count number of children per parent (for averaging) - single count for all parameters
-        child_count = torch.zeros(N, dtype=torch.float, device=delta_means.device)
-        child_count.scatter_add_(0, valid_parent_indices, torch.ones_like(valid_parent_indices, dtype=torch.float))
-        
-        # Accumulate changes to parents using scatter_add
-        parent_delta_means = torch.zeros(N, 3, device=delta_means.device)
-        parent_delta_means.scatter_add_(0, valid_parent_indices.unsqueeze(-1).expand(-1, 3), delta_means)
-        
-        parent_delta_sh0 = torch.zeros_like(runner.splats["sh0"])
-        parent_delta_sh0.scatter_add_(0, valid_parent_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, 1, 3), delta_sh0)
-        
-        shN_shape = runner.splats["shN"].shape
-        parent_delta_shN = torch.zeros_like(runner.splats["shN"])
-        parent_delta_shN.scatter_add_(0, valid_parent_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, shN_shape[1], 3), delta_shN)
-        
-        # Average changes: divide by child count (avoid division by zero)
-        child_count = child_count.clamp_min(1.0)  # [N,]
-        
-        parent_delta_means = parent_delta_means / child_count.unsqueeze(-1)  # [N, 3]
-        parent_delta_sh0 = parent_delta_sh0 / child_count.unsqueeze(-1).unsqueeze(-1)  # [N, 1, 3]
-        parent_delta_shN = parent_delta_shN / child_count.unsqueeze(-1).unsqueeze(-1)  # [N, K, 3]
-        
-        # Add averaged changes to parent parameters (residual parameters only)
-        # This implements restriction: fine->coarse transfer for parameters with prolongation
-        runner.splats["means"].data[valid_parent_indices] += parent_delta_means[valid_parent_indices]
-        runner.splats["sh0"].data[valid_parent_indices] += parent_delta_sh0[valid_parent_indices]
-        runner.splats["shN"].data[valid_parent_indices] += parent_delta_shN[valid_parent_indices]
+        # Apply parent deltas to parent parameters
+        for key in param_keys:
+            # For other parameters: parent_param_new = parent_param_old + parent_delta
+            runner.splats[key].data[valid_parent_indices] += parent_deltas[key][valid_parent_indices]
         
         # Subtract changes from fine level parameters (to maintain optimized hierarchical values)
         # This ensures that fine level still renders with optimized values after restriction
-        runner.splats["means"].data[valid_indices] -= delta_means
-        runner.splats["sh0"].data[valid_indices] -= delta_sh0
-        runner.splats["shN"].data[valid_indices] -= delta_shN
+        for key in param_keys:
+            if key == "means":
+                # For means, we need to compensate for parent's movement to maintain absolute position
+                # Get scale_factor for each child
+                scale_factor = runner.multigrid_gaussians.position_scale_reduction ** (valid_child_levels.float() - 1)
+                scale_factor = scale_factor.unsqueeze(-1)  # [K, 1] for broadcasting
+                
+                # Get parent_delta for each child's parent
+                runner.splats[key].data[valid_indices] -= child_deltas[key] / scale_factor.clamp_min(1e-8)
+                del scale_factor
+            else:
+                # For other parameters (including quats): child_residual_new = child_residual_old - child_delta
+                # Quats use addition (normalize will be applied later)
+                runner.splats[key].data[valid_indices] -= child_deltas[key]
         
         # Free all intermediate variables after restriction
-        del final_means, final_sh0, final_shN
-        del delta_means, delta_sh0, delta_shN
-        del parent_delta_means, parent_delta_sh0, parent_delta_shN
-        del child_count
-        # Free initial values after restriction is complete
-        del initial_means, initial_sh0, initial_shN
+        del child_deltas, parent_deltas, initial_params
+        del valid_parent_indices, valid_child_levels
+        
         # Free restriction-related variables before recursive call
-        del valid_parent_indices, valid_mask
+        del valid_mask
+        # Invalidate cache after parameter updates
+        runner.multigrid_gaussians.invalidate_splats_cache()
         torch.cuda.empty_cache()
     
     # ========== Recurse to coarser level ==========
@@ -573,11 +620,16 @@ def vcycle_recursive(
         pbar=pbar,
         vcycle_idx=vcycle_idx,
         losses=losses,
+        global_tic=global_tic,
     )
     
     # Free variables that are no longer needed after recursive call
-    # (visible_mask, parent_indices, has_parent, valid_indices are not used in upward pass)
-    del visible_mask, parent_indices, has_parent, valid_indices
+    # (visible_mask, parent_indices, has_parent are not used in upward pass)
+    del visible_mask, parent_indices, has_parent
+    
+    # Note: Prolongation is not needed for residual parameters
+    # Coarse level changes are automatically reflected in fine level through get_splats
+    # which uses parent's current residual values when computing hierarchical structure
     
     # ========== Upward: Smoothing at current level ==========
     # Smoothing steps at current level (after returning from coarser level)
@@ -595,6 +647,7 @@ def vcycle_recursive(
             step=log_step,
             data=data,
             target_level=target_level,
+            global_tic=global_tic,
         )
         losses.append(loss)
         
@@ -626,6 +679,7 @@ def perform_vcycle(
     cfg: Config,
     pbar: Optional[tqdm.tqdm] = None,
     vcycle_idx: int = 0,
+    global_tic: Optional[float] = None,
 ) -> Tuple[int, List[float]]:
     """
     Perform a single V-cycle: max_level -> coarsest_level -> max_level.
@@ -669,6 +723,7 @@ def perform_vcycle(
         pbar=pbar,
         vcycle_idx=vcycle_idx,
         losses=[],
+        global_tic=global_tic,
     )
 
 
@@ -684,6 +739,7 @@ def perform_inv_fcycle(
     cfg: Config,
     pbar: Optional[tqdm.tqdm] = None,
     cycle_idx: int = 0,
+    global_tic: Optional[float] = None,
 ) -> Tuple[int, List[float]]:
     """
     Perform an inv-F cycle: finest~coarsest -> finest~(coarsest+1) -> ... -> finest~finest.
@@ -729,6 +785,7 @@ def perform_inv_fcycle(
             cfg=cfg,
             pbar=pbar,
             vcycle_idx=cycle_idx,  # Use cycle_idx for display
+            global_tic=global_tic,
         )
         all_losses.extend(cycle_losses)
         
@@ -1033,9 +1090,7 @@ class Runner:
             packed=self.cfg.packed,
             sparse_grad=self.cfg.sparse_grad,
             absgrad=(
-                self.cfg.strategy.absgrad
-                if isinstance(self.cfg.strategy, DefaultStrategy)
-                else False
+                self.cfg.strategy.absgrad if hasattr(self.cfg.strategy, "absgrad") else False
             ),
             distributed=self.world_size > 1,
             with_ut=self.cfg.with_ut,
@@ -1045,14 +1100,132 @@ class Runner:
         
         return render_colors, render_alphas, info
 
+    def render_at_level(
+        self,
+        target_level: int,
+        pixels_gt: Tensor,  # Original GT image [1, H, W, 3]
+        original_height: int,
+        original_width: int,
+        camtoworlds: Tensor,
+        Ks_original: Tensor,  # Original Ks before any downsampling
+        image_multigrid_max_level: int,
+        sh_degree: int,
+        near_plane: float,
+        far_plane: float,
+        image_ids: Tensor,
+        masks: Optional[Tensor] = None,
+        render_mode: str = "RGB",
+        force_original_resolution: bool = False,
+    ) -> Tuple[Tensor, Tensor, Tensor, Dict]:
+        """
+        Render at a specific level and return downsampled GT and rendered image.
+        
+        Args:
+            target_level: LOD level to render at
+            pixels_gt: Original GT image [1, H, W, 3]
+            original_height: Original image height
+            original_width: Original image width
+            camtoworlds: Camera-to-world matrices [1, 4, 4]
+            Ks_original: Original camera intrinsics [1, 3, 3]
+            image_multigrid_max_level: Maximum level for image multigrid
+            sh_degree: Spherical harmonics degree
+            near_plane: Near plane distance
+            far_plane: Far plane distance
+            image_ids: Image IDs [1,]
+            masks: Optional masks [1, H, W]
+            render_mode: Render mode ("RGB", "RGB+ED", etc.)
+        
+        Returns:
+            rendered_colors: Rendered image at target_level resolution [1, H, W, 3]
+            pixels_downsampled: Downsampled GT at target_level resolution [1, H, W, 3]
+            alphas: Alpha channel [1, H, W, 1] or None
+            info: Info dict from rasterization
+        """
+        cfg = self.cfg
+        device = self.device
+        
+        # Calculate downsample factor: 2^(max_level - target_level)
+        if force_original_resolution:
+            downsample_factor = 1
+        else:
+            downsample_factor = 2 ** (image_multigrid_max_level - target_level)
+            downsample_factor = max(1, downsample_factor)  # Ensure at least 1 (no upsampling)
+        
+        # Calculate target resolution
+        height = max(1, original_height // downsample_factor)
+        width = max(1, original_width // downsample_factor)
+        
+        # Downsample GT image
+        if downsample_factor > 1:
+            pixels_bchw = pixels_gt.permute(0, 3, 1, 2)  # [1, 3, H, W]
+            pixels_downsampled_bchw = F.interpolate(
+                pixels_bchw,
+                size=(height, width),
+                mode='bilinear',
+                align_corners=False,
+            )
+            pixels_downsampled = pixels_downsampled_bchw.permute(0, 2, 3, 1)  # [1, H, W, 3]
+        else:
+            pixels_downsampled = pixels_gt  # [1, H, W, 3]
+        
+        # Downsample Ks (camera intrinsics)
+        Ks = Ks_original.clone()  # Avoid in-place modification
+        if downsample_factor > 1:
+            Ks[:, 0, 0] = Ks_original[:, 0, 0] / downsample_factor  # fx
+            Ks[:, 1, 1] = Ks_original[:, 1, 1] / downsample_factor  # fy
+            Ks[:, 0, 2] = Ks_original[:, 0, 2] / downsample_factor  # cx
+            Ks[:, 1, 2] = Ks_original[:, 1, 2] / downsample_factor  # cy
+        
+        # Downsample masks if provided
+        masks_downsampled = None
+        if masks is not None:
+            if downsample_factor > 1:
+                masks_bchw = masks.unsqueeze(1).float()  # [1, 1, H, W]
+                masks_downsampled_bchw = F.interpolate(
+                    masks_bchw,
+                    size=(height, width),
+                    mode='nearest',
+                )
+                masks_downsampled = masks_downsampled_bchw.squeeze(1).bool()  # [1, H, W]
+            else:
+                masks_downsampled = masks
+        
+        # Render at target_level
+        # Note: backgrounds are handled in trainer after rendering (not in rasterize_splats)
+        renders, alphas, info = self.rasterize_splats(
+            camtoworlds=camtoworlds,
+            Ks=Ks,
+            width=width,
+            height=height,
+            level=target_level,
+            sh_degree=sh_degree,
+            near_plane=near_plane,
+            far_plane=far_plane,
+            image_ids=image_ids,
+            render_mode=render_mode,
+            masks=masks_downsampled,
+        )
+        
+        # Extract colors from renders
+        if renders.shape[-1] == 4:
+            rendered_colors = renders[..., 0:3]  # [1, H, W, 3]
+        else:
+            rendered_colors = renders  # [1, H, W, 3]
+        
+        return rendered_colors, pixels_downsampled, alphas, info
+
     def _train_step(
         self,
         step: int,
         data: Dict,
         target_level: int,
+        global_tic: Optional[float] = None,
     ) -> float:
         """
         Perform a single training step at a specific LOD level.
+        
+        For multigrid: if not finest level, computes residual from finer level and uses
+        residual_target = GT - render_finer as training objective.
         
         Args:
             step: Current training step
@@ -1089,57 +1262,8 @@ class Runner:
         # multigrid_gaussians.levels.max() is only used for V-cycle level selection
         image_multigrid_max_level = cfg.max_level if cfg.max_level is not None else 1
         
-        # Calculate downsample factor: 2^(max_level - target_level)
-        downsample_factor = 2 ** (image_multigrid_max_level - target_level)
-        downsample_factor = max(1, downsample_factor)  # Ensure at least 1 (no upsampling)
-        
-        # Downsample image if needed
+        # Store original dimensions before any downsampling
         original_height, original_width = image_data.shape[1:3]
-        if downsample_factor > 1:
-            # Calculate new dimensions
-            new_height = max(1, original_height // downsample_factor)
-            new_width = max(1, original_width // downsample_factor)
-            
-            # Downsample image using bilinear interpolation
-            # Convert to [B, C, H, W] format for F.interpolate
-            image_data_bchw = image_data.permute(0, 3, 1, 2)  # [1, C, H, W]
-            image_data_downsampled = F.interpolate(
-                image_data_bchw,
-                size=(new_height, new_width),
-                mode='bilinear',
-                align_corners=False,
-            )
-            # Convert back to [B, H, W, C] format
-            image_data = image_data_downsampled.permute(0, 2, 3, 1)  # [1, H, W, C]
-            
-            # Downsample Ks (camera intrinsics)
-            # Ks format: [fx, 0, cx; 0, fy, cy; 0, 0, 1]
-            # When downsample by factor f, we need to divide fx, fy, cx, cy by f
-            Ks = Ks.clone()  # Avoid in-place modification
-            Ks[:, 0, 0] = Ks[:, 0, 0] / downsample_factor  # fx
-            Ks[:, 1, 1] = Ks[:, 1, 1] / downsample_factor  # fy
-            Ks[:, 0, 2] = Ks[:, 0, 2] / downsample_factor  # cx
-            Ks[:, 1, 2] = Ks[:, 1, 2] / downsample_factor  # cy
-            
-            # Downsample masks if provided
-            if "mask" in data:
-                mask_data = data["mask"].to(device)  # [H, W] or [1, H, W]
-                if mask_data.dim() == 2:
-                    mask_data = mask_data.unsqueeze(0)  # [1, H, W]
-                # Downsample mask using nearest neighbor (preserve binary values)
-                mask_data_bchw = mask_data.unsqueeze(1).float()  # [1, 1, H, W]
-                mask_data_downsampled = F.interpolate(
-                    mask_data_bchw,
-                    size=(new_height, new_width),
-                    mode='nearest',
-                )
-                masks = mask_data_downsampled.squeeze(1).bool()  # [1, H, W]
-            else:
-                masks = None
-        else:
-            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
-            if masks is not None and masks.dim() == 2:
-                masks = masks.unsqueeze(0)
         
         # Handle RGBA images: extract RGB and alpha separately
         if image_data.shape[-1] == 4:
@@ -1151,23 +1275,27 @@ class Runner:
             pixels_alpha = None
             has_alpha = False
         
-        num_train_rays_per_step = (
-            pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
-        )
         # image_id is int from dataset, convert to tensor
         if isinstance(data["image_id"], torch.Tensor):
             image_ids = data["image_id"].to(device)
         else:
             image_ids = torch.tensor(data["image_id"], device=device)
-
+        
+        # Prepare masks (will be downsampled in render_at_level if needed)
+        masks = data["mask"].to(device) if "mask" in data else None
+        if masks is not None and masks.dim() == 2:
+            masks = masks.unsqueeze(0)  # [H, W] -> [1, H, W]
+        
+        # Calculate downsample factor for current target_level (for points downsampling)
+        downsample_factor = 2 ** (image_multigrid_max_level - target_level)
+        downsample_factor = max(1, downsample_factor)
+        
         if cfg.depth_loss:
             points = data["points"].to(device)  # [1, M, 2]
             depths_gt = data["depths"].to(device)  # [1, M]
             # Downsample points if image was downsampled
             if downsample_factor > 1:
                 points = points / downsample_factor  # Scale point coordinates
-
-        height, width = pixels.shape[1:3]
 
         if cfg.pose_noise:
             camtoworlds = self.pose_perturb(camtoworlds, image_ids)
@@ -1190,25 +1318,108 @@ class Runner:
         elif cfg.white_background:
             backgrounds = torch.ones(1, 3, device=device)  # [C=1, 3] for white background
         
-        # Render at target_level
-        renders, alphas, info = self.rasterize_splats(
+        # Store original Ks before any downsampling (needed for render_at_level)
+        Ks_original = data["K"].to(device)  # [3, 3] or [1, 3, 3]
+        if Ks_original.dim() == 2:
+            Ks_original = Ks_original.unsqueeze(0)  # [3, 3] -> [1, 3, 3]
+        
+        # Multigrid residual calculation: if not finest level, compute residual from finer level
+        # This must be done in _train_step because view changes every step
+        residual_target = None
+        finer_colors_downsampled = None
+        max_level_to_use = cfg.max_level if cfg.max_level is not None else image_multigrid_max_level
+        if target_level < max_level_to_use:
+            # Render finer level (target_level + 1) to compute residual target
+            # Finer level should be rendered at its own resolution (target_level + 1)
+            with torch.no_grad():
+                # Render finer level at target_level + 1 resolution
+                finer_colors, finer_pixels_downsampled, finer_alphas, _ = self.render_at_level(
+                    target_level=target_level + 1,
+                    pixels_gt=pixels,
+                    original_height=original_height,
+                    original_width=original_width,
+                    camtoworlds=camtoworlds,
+                    Ks_original=Ks_original,
+                    image_multigrid_max_level=image_multigrid_max_level,
+                    sh_degree=sh_degree_to_use,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    image_ids=image_ids,
+                    masks=masks,
+                    render_mode="RGB",
+                    force_original_resolution=False,  # Render at target_level + 1 resolution
+                )
+                
+                if cfg.white_background or cfg.random_bkgd:
+                    finer_colors = finer_colors + backgrounds * (1.0 - finer_alphas)
+
+                # Compute residual at finer level resolution
+                # Residual target = GT_downsampled_to_finer - render_finer (at finer level resolution)
+                residual_target_finer = finer_pixels_downsampled - finer_colors  # [1, H_finer, W_finer, 3]
+                
+                # Downsample residual from finer level resolution to current target level resolution
+                # target_level + 1 has 2x higher resolution than target_level
+                finer_downsample = 2 ** (image_multigrid_max_level - (target_level + 1))
+                current_downsample = downsample_factor
+                
+                if finer_downsample < current_downsample:
+                    # Finer level has higher resolution, need to downsample residual
+                    current_height = max(1, original_height // current_downsample)
+                    current_width = max(1, original_width // current_downsample)
+                    
+                    residual_target_downsampled_bchw = residual_target_finer.permute(0, 3, 1, 2)  # [1, 3, H_finer, W_finer]
+                    residual_target_downsampled_bchw = F.interpolate(
+                        residual_target_downsampled_bchw,
+                        size=(current_height, current_width),
+                        mode='bilinear',
+                        align_corners=False,
+                    )
+                    residual_target = residual_target_downsampled_bchw.permute(0, 2, 3, 1)  # [1, H, W, 3]
+                    del residual_target_downsampled_bchw
+
+                    finer_colors_downsampled = finer_colors.permute(0, 3, 1, 2)
+                    finer_colors_downsampled = F.interpolate(
+                        finer_colors_downsampled,
+                        size=(current_height, current_width),
+                        mode='bilinear',
+                        align_corners=False,
+                    )
+                    finer_colors_downsampled = finer_colors_downsampled.permute(0, 2, 3, 1)
+
+                else:
+                    # Same resolution (shouldn't happen, but handle gracefully)
+                    residual_target = residual_target_finer
+                    finer_colors_downsampled = finer_colors
+                
+                del finer_colors, finer_pixels_downsampled, residual_target_finer
+                torch.cuda.empty_cache()
+        
+        # Render at target_level using render_at_level function
+        colors, pixels_downsampled, alphas, info = self.render_at_level(
+            target_level=target_level,
+            pixels_gt=pixels,
+            original_height=original_height,
+            original_width=original_width,
             camtoworlds=camtoworlds,
-            Ks=Ks,
-            width=width,
-            height=height,
-            level=target_level,  # Use target_level for LOD
+            Ks_original=Ks_original,
+            image_multigrid_max_level=image_multigrid_max_level,
             sh_degree=sh_degree_to_use,
             near_plane=cfg.near_plane,
             far_plane=cfg.far_plane,
             image_ids=image_ids,
-            render_mode="RGB+ED" if cfg.depth_loss else "RGB",
             masks=masks,
-            backgrounds=backgrounds,
+            render_mode="RGB+ED" if cfg.depth_loss else "RGB",
         )
-        if renders.shape[-1] == 4:
-            colors, depths = renders[..., 0:3], renders[..., 3:4]
+        
+        # Extract depths if available
+        if cfg.depth_loss and info.get("depths") is not None:
+            depths = info["depths"]
         else:
-            colors, depths = renders, None
+            depths = None
+        
+        # Update pixels to use downsampled version for loss calculation
+        pixels = pixels_downsampled
+        height, width = pixels.shape[1:3]
 
         if cfg.use_bilateral_grid:
             grid_y, grid_x = torch.meshgrid(
@@ -1224,10 +1435,12 @@ class Runner:
                 image_ids.unsqueeze(-1),
             )["rgb"]
 
-
-        if cfg.random_bkgd:
-            bkgd = torch.rand(1, 3, device=device)
-            colors = colors + bkgd * (1.0 - alphas)
+        # Apply random background if enabled
+        # Note: multigrid_gaussians_v2.rasterize_splats has backgrounds commented out,
+        # so we need to apply it manually here
+        if cfg.random_bkgd or cfg.white_background:
+            colors = colors + backgrounds * (1.0 - alphas)
+        
 
         self.cfg.strategy.step_pre_backward(
             params=self.splats,
@@ -1237,11 +1450,38 @@ class Runner:
             info=info,
         )
 
-        # loss
-        l1loss = F.l1_loss(colors, pixels)
-        ssimloss = 1.0 - fused_ssim(
-            colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-        )
+        # Multigrid residual equation: 
+        # residual_color = render_current - GT_current
+        # residual_finer = render_finer - GT_finer (at finer level)
+        # We want: residual_color ≈ residual_finer_downsampled (coarse residual should match fine residual)
+        # This means: (render_current - GT_current) ≈ (render_finer - GT_finer)_downsampled
+        # Note: If render_finer ≈ GT_finer, then residual_finer ≈ 0, and residual_error ≈ residual_color,
+        # which becomes equivalent to standard GT loss: ||render_current - GT_current||
+        if residual_target is not None:
+            # residual_target = GT_finer - render_finer (already computed and downsampled)
+            # residual_finer = render_finer - GT_finer = -(GT_finer - render_finer) = -residual_target
+            residual_color = colors - finer_colors_downsampled
+
+            residual_error = residual_color - residual_target
+
+            # residual_finer_downsampled = -residual_target  # [1, H, W, 3] (render_finer - GT_finer, downsampled)
+            
+            # Residual error: difference between current residual and finer residual
+            # If residual_finer ≈ 0 (render_finer ≈ GT_finer), this becomes standard loss
+            # residual_error = residual_color - residual_target  # [1, H, W, 3]
+            l1loss = F.l1_loss(residual_error, torch.zeros_like(residual_error))
+            ssimloss = 1.0 - fused_ssim(
+                residual_error.permute(0, 3, 1, 2), 
+                torch.zeros_like(residual_error.permute(0, 3, 1, 2)), 
+                padding="valid"
+            )
+        else:
+            # Standard loss: render should match GT (finest level)
+            l1loss = F.l1_loss(colors, pixels)
+            ssimloss = 1.0 - fused_ssim(
+                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+            )
+        
         loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
         
         # Opacity loss: if GT has alpha channel, add opacity loss
@@ -1278,7 +1518,7 @@ class Runner:
             loss += tvloss
         
         if cfg.opacity_reg > 0.0:
-            # Opacity regularization: apply to independent opacity values
+            # Opacity regularization: apply to residual opacity values (hierarchical)
             loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"][info["visible_mask"]]).mean()
             print("BISANGBISANG")
         # Scale regularization (applied to all gaussians)
@@ -1355,9 +1595,31 @@ class Runner:
             else:
                 visibility_mask = (info["radii"] > 0).all(-1).any(0)
 
-    # optimize
-    
+    # optimize    
         opacity_grad_norms.append(self.splats["opacities"].grad.norm().item())
+
+        # # Debug: Check parameter and optimizer state dtype/device/layout
+        # for k, v in self.splats.items():
+        #     print(f"Parameter {k}: shape={v.shape}, dtype={v.dtype}, device={v.device}, contiguous={v.is_contiguous()}")
+        #     if v.grad is not None:
+        #         print(f"  grad: shape={v.grad.shape}, dtype={v.grad.dtype}, device={v.grad.device}, contiguous={v.grad.is_contiguous()}")
+        #     else:
+        #         print(f"  grad: None")
+            
+        #     # Check optimizer state for this parameter
+        #     if k in self.optimizers:
+        #         optimizer = self.optimizers[k]
+        #         for param_group in optimizer.param_groups:
+        #             for param in param_group["params"]:
+        #                 if param is v and param in optimizer.state:
+        #                     state = optimizer.state[param]
+        #                     print(f"  optimizer state:")
+        #                     for state_key, state_value in state.items():
+        #                         if isinstance(state_value, torch.Tensor):
+        #                             print(f"    {state_key}: shape={state_value.shape}, dtype={state_value.dtype}, device={state_value.device}, contiguous={state_value.is_contiguous()}")
+        #                         else:
+        #                             print(f"    {state_key}: {type(state_value)}")
+        #     print()
 
         for optimizer in self.optimizers.values():
             if cfg.visible_adam:
@@ -1420,7 +1682,7 @@ class Runner:
         # Measure metrics if needed (lightweight, no image saving)
         # Only measure if step hasn't exceeded max_steps
         if step < cfg.max_steps and cfg.metric_interval > 0 and step % cfg.metric_interval == 0:
-            self.measure_metric(step, stage="val")
+            self.measure_metric(step, stage="val", global_tic=global_tic)
         
         # Eval (full evaluation with image saving)
         # Only eval if step hasn't exceeded max_steps
@@ -1514,6 +1776,7 @@ class Runner:
         
         pbar = tqdm.tqdm(range(init_step, max_steps))
         
+        # self.save_visualization(-1)
         while current_step < max_steps:
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
@@ -1559,6 +1822,7 @@ class Runner:
                     cfg=cfg,
                     pbar=pbar,
                     vcycle_idx=vcycle_idx,
+                    global_tic=global_tic,
                 )
             elif cfg.cycle_type == "inv_fcycle":
                 # inv-F cycle: use cfg.max_level for regular training
@@ -1578,6 +1842,7 @@ class Runner:
                     cfg=cfg,
                     pbar=pbar,
                     cycle_idx=vcycle_idx,
+                    global_tic=global_tic,
                 )
             else:
                 raise ValueError(f"Unknown cycle_type: {cfg.cycle_type}")
@@ -1695,7 +1960,6 @@ class Runner:
                     mem = torch.cuda.max_memory_allocated() / 1024**3
                     stats = {
                         "mem": mem,
-                        "ellipse_time": time.time() - global_tic,
                         "num_GS": len(self.splats["means"]),
                     }
                     print("Step: ", step, stats)
@@ -1777,7 +2041,7 @@ class Runner:
             print("="*60)
 
     @torch.no_grad()
-    def measure_metric(self, step: int, stage: str = "val") -> Dict[str, float]:
+    def measure_metric(self, step: int, stage: str = "val", global_tic = None) -> Dict[str, float]:
         """Measure metrics only (no image saving).
         
         Renders at finest level and computes PSNR, SSIM, LPIPS metrics.
@@ -1881,7 +2145,8 @@ class Runner:
                     "num_GS": len(self.splats["means"]),
                 }
             )
-            
+            if global_tic is not None:
+                stats["ellipse_time"] = time.time() - global_tic
             # Print metrics
             if cfg.use_bilateral_grid:
                 print(
@@ -2102,7 +2367,7 @@ class Runner:
             return
         
         # Get max level
-        max_level = int(self.multigrid_gaussians.levels.max().item())
+        max_level = int(cfg.max_level)
         
         # Generate level sequence: 1, 2, 3, ..., up to max_level (left to right: low to high)
         levels_to_render = list(range(1, max_level + 1))

@@ -490,9 +490,6 @@ class MultigridStrategy(Strategy):
                 optimizers=optimizers,
                 state=state,
                 mask=final_prune_mask,
-                levels=state["levels"],
-                parent_indices=state["parent_indices"],
-                level_indices=state["level_indices"],
             )
 
         return n_prune

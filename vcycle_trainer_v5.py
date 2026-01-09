@@ -36,7 +36,7 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-from gsplat.strategy.multigrid_v4 import MultigridStrategy
+from gsplat.strategy.multigrid_v5 import MultigridStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 from multigrid_gaussians import MultigridGaussians
@@ -259,7 +259,7 @@ class Config:
             settings_parts = [
                 f"type_{self.dataset_type}",
                 f"factor_{self.data_factor}",
-                "v1",
+                "v5",
             ]
             if self.dataset_type == "nerf" and self.white_background:
                 settings_parts.append("whitebg")
@@ -451,6 +451,7 @@ def vcycle_recursive(
         initial_means = initial_splats["means"][valid_indices].clone().detach()  # [K, 3]
         initial_sh0 = initial_splats["sh0"][valid_indices].clone().detach()  # [K, 1, 3]
         initial_shN = initial_splats["shN"][valid_indices].clone().detach()  # [K, K, 3]
+        initial_opacities = initial_splats["opacities"][valid_indices].clone().detach()  # [K,]
         # Free initial_splats immediately after extracting needed values
         del initial_splats
     
@@ -493,17 +494,18 @@ def vcycle_recursive(
         final_means = final_splats["means"][valid_indices]  # [K, 3]
         final_sh0 = final_splats["sh0"][valid_indices]  # [K, 1, 3]
         final_shN = final_splats["shN"][valid_indices]  # [K, K, 3]
+        final_opacities = final_splats["opacities"][valid_indices]  # [K,]
         # Free final_splats immediately after extracting needed values
         del final_splats
         
-        # Calculate changes (delta) for residual parameters only
+        # Calculate changes (delta) for residual parameters and opacity
         # Residual parameters (means, sh0, shN) have prolongation (parent + child residual),
         # so restriction (fine->coarse) is also defined for them.
-        # Independent parameters (quats, scales, opacities) have no prolongation,
-        # so restriction is not applicable.
+        # Opacity is independent but we still transfer its changes to parent.
         delta_means = final_means - initial_means  # [K, 3]
         delta_sh0 = final_sh0 - initial_sh0  # [K, 1, 3]
         delta_shN = final_shN - initial_shN  # [K, K, 3]
+        delta_opacities = final_opacities - initial_opacities  # [K,]
         
         # Get parent indices for valid gaussians
         valid_parent_indices = parent_indices[valid_indices]  # [K,]
@@ -532,27 +534,56 @@ def vcycle_recursive(
         parent_delta_sh0 = parent_delta_sh0 / child_count.unsqueeze(-1).unsqueeze(-1)  # [N, 1, 3]
         parent_delta_shN = parent_delta_shN / child_count.unsqueeze(-1).unsqueeze(-1)  # [N, K, 3]
         
-        # Add averaged changes to parent parameters (residual parameters only)
+        # Accumulate opacity changes to parents
+        parent_delta_opacities = torch.zeros(N, dtype=delta_opacities.dtype, device=delta_opacities.device)
+        parent_delta_opacities.scatter_add_(0, valid_parent_indices, delta_opacities)
+        parent_delta_opacities = parent_delta_opacities / child_count  # [N,]
+        
+        # Add averaged changes to parent parameters (residual parameters and opacity)
         # This implements restriction: fine->coarse transfer for parameters with prolongation
+        # Opacity is independent but we still transfer its changes to parent
         runner.splats["means"].data[valid_parent_indices] += parent_delta_means[valid_parent_indices]
         runner.splats["sh0"].data[valid_parent_indices] += parent_delta_sh0[valid_parent_indices]
         runner.splats["shN"].data[valid_parent_indices] += parent_delta_shN[valid_parent_indices]
+        runner.splats["opacities"].data[valid_parent_indices] += parent_delta_opacities[valid_parent_indices]
         
         # Subtract changes from fine level parameters (to maintain optimized hierarchical values)
         # This ensures that fine level still renders with optimized values after restriction
+        # Note: Only subtract for residual parameters (means, sh0, shN)
+        # Opacity is independent, so we don't subtract its delta from child
         runner.splats["means"].data[valid_indices] -= delta_means
         runner.splats["sh0"].data[valid_indices] -= delta_sh0
         runner.splats["shN"].data[valid_indices] -= delta_shN
         
         # Free all intermediate variables after restriction
-        del final_means, final_sh0, final_shN
-        del delta_means, delta_sh0, delta_shN
-        del parent_delta_means, parent_delta_sh0, parent_delta_shN
+        del final_means, final_sh0, final_shN, final_opacities
+        del delta_means, delta_sh0, delta_shN, delta_opacities
+        del parent_delta_means, parent_delta_sh0, parent_delta_shN, parent_delta_opacities
         del child_count
         # Free initial values after restriction is complete
-        del initial_means, initial_sh0, initial_shN
+        del initial_means, initial_sh0, initial_shN, initial_opacities
+        
+        # Store coarser level (level - 1) visible gaussians' opacity before recursive call for prolongation
+        # This will be used to compute parent opacity changes after recursive call
+        # We need to find level - 1 visible gaussians and store their opacity
+        coarser_level = level - 1
+        if coarser_level >= 1:
+            runner.multigrid_gaussians.set_visible_mask(coarser_level)
+            coarser_visible_mask = runner.multigrid_gaussians.visible_mask  # [N,]
+            coarser_visible_indices = torch.where(coarser_visible_mask)[0]  # [M,]
+            
+            if len(coarser_visible_indices) > 0:
+                # Store coarser level visible gaussians' opacity before recursive call
+                coarser_opacities_before = runner.splats["opacities"].data[coarser_visible_indices].clone()  # [M,]
+            else:
+                coarser_visible_indices = torch.empty(0, dtype=torch.long, device=runner.multigrid_gaussians.levels.device)
+                coarser_opacities_before = torch.empty(0, dtype=runner.splats["opacities"].dtype, device=runner.splats["opacities"].device)
+        else:
+            coarser_visible_indices = torch.empty(0, dtype=torch.long, device=runner.multigrid_gaussians.levels.device)
+            coarser_opacities_before = torch.empty(0, dtype=runner.splats["opacities"].dtype, device=runner.splats["opacities"].device)
+        
         # Free restriction-related variables before recursive call
-        del valid_parent_indices, valid_mask
+        del valid_mask
         torch.cuda.empty_cache()
     
     # ========== Recurse to coarser level ==========
@@ -576,8 +607,75 @@ def vcycle_recursive(
     )
     
     # Free variables that are no longer needed after recursive call
-    # (visible_mask, parent_indices, has_parent, valid_indices are not used in upward pass)
-    del visible_mask, parent_indices, has_parent, valid_indices
+    # (visible_mask, parent_indices, has_parent are not used in upward pass)
+    del visible_mask, parent_indices, has_parent
+    
+    # ========== Prolongation: Transfer coarse level changes to fine level ==========
+    # This operation updates parameter values only, no gradients needed
+    # Use no_grad to prevent computation graph accumulation
+    with torch.no_grad():
+        # Get coarser level (level - 1) visible gaussians after recursive call
+        coarser_level = level - 1
+        if coarser_level >= 1 and len(coarser_visible_indices) > 0:
+                # Match stored coarser level indices with current coarser level indices
+                N = len(runner.multigrid_gaussians.levels)
+                
+                # Get opacity after recursive call for stored coarser level indices
+                valid_stored_mask = (coarser_visible_indices >= 0) & (coarser_visible_indices < N)
+                if valid_stored_mask.any():
+                    valid_stored_coarser_indices = coarser_visible_indices[valid_stored_mask]
+                    coarser_opacities_after_stored = runner.splats["opacities"].data[valid_stored_coarser_indices]  # [M,]
+                    coarser_opacities_before_stored = coarser_opacities_before[valid_stored_mask]  # [M,]
+                    
+                    # Calculate coarser level opacity changes
+                    coarser_delta_opacities = coarser_opacities_after_stored - coarser_opacities_before_stored  # [M,]
+                    
+                    # Create a mapping from coarser level indices to opacity deltas
+                    coarser_delta_map = torch.zeros(N, dtype=coarser_delta_opacities.dtype, device=coarser_delta_opacities.device)
+                    coarser_delta_map[valid_stored_coarser_indices] = coarser_delta_opacities
+                    
+                    # Now find children of coarser level visible gaussians (i.e., current level gaussians)
+                    # Get current level visible gaussians
+                    runner.multigrid_gaussians.set_visible_mask(target_level)
+                    current_visible_mask = runner.multigrid_gaussians.visible_mask  # [N,]
+                    parent_indices = runner.multigrid_gaussians.parent_indices  # [N,]
+                    
+                    # Find current level gaussians whose parents are in coarser level visible gaussians
+                    current_visible_indices = torch.where(current_visible_mask)[0]  # [K,]
+                    if len(current_visible_indices) > 0:
+                        current_parent_indices = parent_indices[current_visible_indices]  # [K,]
+                        
+                        # Check which current level gaussians have parents in stored coarser level visible gaussians
+                        # Create a boolean mask: True if parent is in valid_stored_coarser_indices
+                        # Use broadcasting to check membership efficiently
+                        valid_parent_mask = (current_parent_indices.unsqueeze(-1) == valid_stored_coarser_indices.unsqueeze(0)).any(dim=-1)
+                        
+                        if valid_parent_mask.any():
+                            # Get children whose parents are in coarser level visible gaussians
+                            children_indices = current_visible_indices[valid_parent_mask]  # [L,]
+                            children_parent_indices = current_parent_indices[valid_parent_mask]  # [L,]
+                            
+                            # Get parent opacity deltas for these children
+                            children_parent_deltas = coarser_delta_map[children_parent_indices]  # [L,]
+                            
+                            # Add parent opacity changes to children (prolongation)
+                            # Opacity is independent but we transfer parent changes to children
+                            runner.splats["opacities"].data[children_indices] += children_parent_deltas
+                            
+                            # Free prolongation-related variables
+                            del children_indices, children_parent_indices, children_parent_deltas
+                            del valid_parent_mask
+                    
+                    del current_visible_mask, parent_indices, current_visible_indices, current_parent_indices
+                    del coarser_delta_map, coarser_opacities_after_stored, coarser_opacities_before_stored
+                    del coarser_delta_opacities, valid_stored_coarser_indices, valid_stored_mask
+                
+
+        
+        # Free prolongation-related variables
+        del coarser_visible_indices, coarser_opacities_before
+        del valid_indices  # Original valid_indices from restriction
+        torch.cuda.empty_cache()
     
     # ========== Upward: Smoothing at current level ==========
     # Smoothing steps at current level (after returning from coarser level)
@@ -1033,9 +1131,7 @@ class Runner:
             packed=self.cfg.packed,
             sparse_grad=self.cfg.sparse_grad,
             absgrad=(
-                self.cfg.strategy.absgrad
-                if isinstance(self.cfg.strategy, DefaultStrategy)
-                else False
+                self.cfg.strategy.absgrad if hasattr(self.cfg.strategy, "absgrad") else False
             ),
             distributed=self.world_size > 1,
             with_ut=self.cfg.with_ut,

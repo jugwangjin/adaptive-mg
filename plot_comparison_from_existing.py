@@ -99,12 +99,14 @@ def get_result_directories() -> Dict[str, Optional[str]]:
     # Return found directories
     result = {}
     
-    result['simple'] = "/Bean/log/gwangjin/2025/gsplat/baseline/garden_type_colmap_factor_8_norm"
+    result['simple'] = "/Bean/log/gwangjin/2025/gsplat/baseline/garden_type_colmap_factor_8"
     # result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_norm"
     # result['vcycle2'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_norm_2"
     
     # result['vc_v2'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_v2"
-    result['vc_v3'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_v3"
+    # result['vc_v3'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_v3"
+    # result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_vcycle/garden_type_colmap_factor_8_v1"
+    result['inv_fcycle'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_inv_fcycle/garden_type_colmap_factor_8_v6_randbkgd"
 
     # if vcycle_dir:
     #     result['vcycle'] = vcycle_dir
@@ -135,6 +137,7 @@ def parse_stats_files(result_dir: Path) -> Dict[str, Dict[int, float]]:
         'ssim': {},
         'lpips': {},
         'num_GS': {},
+        'ellipse_time': {},
     }
     
     # Find all val_step JSON files
@@ -158,6 +161,8 @@ def parse_stats_files(result_dir: Path) -> Dict[str, Dict[int, float]]:
                     metrics['lpips'][step] = float(data['lpips'])
                 if 'num_GS' in data:
                     metrics['num_GS'][step] = float(data['num_GS'])
+                if 'ellipse_time' in data:
+                    metrics['ellipse_time'][step] = float(data['ellipse_time'])
         except (json.JSONDecodeError, KeyError) as e:
             print(f"Warning: Could not parse {json_file}: {e}")
             continue
@@ -209,13 +214,21 @@ def plot_metric_on_axis(
         'simple': ('s-', 'red', 'Simple'),
         'simple_default': ('s-', 'red', 'Simple (default)'),
         'simple_mcmc': ('d-', 'orange', 'Simple (MCMC)'),
+        'inv_fcycle': ('^-', 'green', 'Inv-F cycle'),
     }
     
     # Plot each method
     for method_name, method_data in methods_with_data.items():
-        values = [method_data.get(step, np.nan) for step in all_steps]
-        style, color, label = styles.get(method_name, ('o-', 'gray', method_name))
-        ax.plot(all_steps, values, linewidth=2, markersize=4, alpha=0.8, label=label)
+        # For ellipse_time, only plot steps that have data (don't fill with NaN)
+        if metric_name == 'ellipse_time':
+            steps_with_data = sorted(method_data.keys())
+            values = [method_data[step] for step in steps_with_data]
+            style, color, label = styles.get(method_name, ('o-', 'gray', method_name))
+            ax.plot(steps_with_data, values, linewidth=2, markersize=4, alpha=0.8, label=label)
+        else:
+            values = [method_data.get(step, np.nan) for step in all_steps]
+            style, color, label = styles.get(method_name, ('o-', 'gray', method_name))
+            ax.plot(all_steps, values, linewidth=2, markersize=4, alpha=0.8, label=label)
         # ax.plot(all_steps, values, style, label=label, linewidth=2, markersize=4, alpha=0.8, color=color)
     
     # Formatting
@@ -304,27 +317,33 @@ def main():
     
     # Create combined graph with all metrics
     print("Creating combined comparison graph...")
-    metrics_to_plot = ['psnr', 'ssim', 'lpips', 'num_GS']
+    metrics_to_plot = ['psnr', 'ssim', 'lpips', 'num_GS', 'ellipse_time']
     ylabels = {
         'psnr': 'PSNR (dB)',
         'ssim': 'SSIM',
         'lpips': 'LPIPS',
         'num_GS': 'Number of Gaussians',
+        'ellipse_time': 'Training Time (s)',
     }
     
-    # Create figure with 2x2 subplots
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    # Create figure with 2x3 subplots (5 metrics, so 2 rows x 3 cols)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     axes = axes.flatten()
     
     # Plot each metric on a subplot
     for idx, metric_name in enumerate(metrics_to_plot):
-        ax = axes[idx]
-        plot_metric_on_axis(
-            ax,
-            all_data,
-            metric_name,
-            ylabel=ylabels.get(metric_name, metric_name.upper())
-        )
+        if idx < len(axes):
+            ax = axes[idx]
+            plot_metric_on_axis(
+                ax,
+                all_data,
+                metric_name,
+                ylabel=ylabels.get(metric_name, metric_name.upper())
+            )
+    
+    # Hide unused subplots
+    for idx in range(len(metrics_to_plot), len(axes)):
+        axes[idx].axis('off')
     
     # Adjust layout and save
     plt.tight_layout()

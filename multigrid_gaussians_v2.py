@@ -18,6 +18,83 @@ from gsplat.rendering import rasterization
 from utils import knn, rgb_to_sh
 
 
+def quaternion_multiply(q1: Tensor, q2: Tensor) -> Tensor:
+    """
+    Multiply two quaternions: q1 * q2.
+    
+    Quaternions are in wxyz format: [w, x, y, z]
+    
+    Args:
+        q1: First quaternion [..., 4]
+        q2: Second quaternion [..., 4]
+    
+    Returns:
+        Product quaternion [..., 4]
+    """
+    w1, x1, y1, z1 = torch.unbind(q1, dim=-1)
+    w2, x2, y2, z2 = torch.unbind(q2, dim=-1)
+    
+    w = w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2
+    x = w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2
+    y = w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2
+    z = w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2
+    
+    result = torch.stack([w, x, y, z], dim=-1)
+    # Normalize to ensure unit quaternion
+    result = F.normalize(result, p=2, dim=-1)
+    return result
+
+
+def child_to_parent_delta(
+    child_delta: Tensor,
+    param_name: str,
+    child_levels: Tensor,
+    position_scale_reduction: float,
+    parent_levels: Tensor,
+) -> Tensor:
+    """
+    Convert child parameter delta to parent delta (restriction).
+    
+    This is the inverse operation of parent_to_child_param:
+    - means: parent_delta = child_delta / scale_factor
+      where scale_factor is based on child_level because:
+      - In get_splats: child_position = parent + child_residual * scale_factor(child_level)
+      - child_delta is the change in child's absolute position
+      - To maintain absolute position after restriction, we need to use the same scale_factor
+      - Note: parent_level = child_level - 1 (always), so we don't need parent_level parameter
+    - scales: parent_delta = child_delta (no change, but -0.6931 is handled separately)
+    - quats: parent_delta = relative rotation (quaternion multiplication)
+    - others: parent_delta = child_delta
+    
+    Args:
+        child_delta: Change in child parameter [N, ...]
+        param_name: Parameter name ("means", "scales", "quats", "opacities", "sh0", "shN", etc.)
+        child_levels: Level of each child [N,] - used for means restriction scaling
+        position_scale_reduction: Scale reduction factor for hierarchical means
+    
+    Returns:
+        Parent delta [N, ...]
+    """
+    if param_name == "means":
+        # child_delta is in world space (from get_splats)
+        # To convert to parent level space, we need to divide by scale_factor(child_level)
+        # scale_factor(child_level) = position_scale_reduction ** (child_level - 1)
+        # This is because in get_splats: child_position = parent + child_residual * scale_factor(child_level)
+        scale_factor = position_scale_reduction ** (parent_levels.float() - 1)  # [N,]
+        scale_factor = scale_factor.unsqueeze(-1)  # [N, 1] for broadcasting with [N, 3]
+        return child_delta / scale_factor.clamp_min(1e-8)  # Avoid division by zero
+    elif param_name == "scales":
+        # scales: parent_delta = child_delta (no change needed, -0.6931 is constant)
+        return child_delta
+    elif param_name == "quats":
+        # quats: parent_delta is already a relative rotation (quaternion)
+        # No conversion needed, just return as-is
+        return child_delta
+    else:
+        # Other parameters: parent_delta = child_delta
+        return child_delta
+
+
 @torch.no_grad()
 def find_closest_points_chunked(
     query_points: Tensor,
@@ -151,11 +228,13 @@ class MultigridGaussians:
                     # Fallback to uniform sampling
                     torch.manual_seed(42)  # For reproducibility
                     level1_indices = torch.randperm(n_level2_all, device=device)[:n_level1]
+                    raise
                 except Exception as e:
                     print(f"Warning: FPS sampling failed ({e}), falling back to uniform sampling")
                     # Fallback to uniform sampling
                     torch.manual_seed(42)  # For reproducibility
                     level1_indices = torch.randperm(n_level2_all, device=device)[:n_level1]
+                    raise
             else:
                 # Uniform sampling: randomly select n_level1 points for Level 1
                 torch.manual_seed(42)  # For reproducibility
@@ -194,11 +273,32 @@ class MultigridGaussians:
             dist_avg_all = torch.sqrt(dist2_avg_all)
             scales_all = torch.log(dist_avg_all * init_scale).unsqueeze(-1).repeat(1, 3)  # [n_all, 3]
             
+            print(torch.min(scales_all, dim=0), torch.max(scales_all, dim=0))
+            print(torch.min(torch.exp(scales_all), dim=0), torch.max(torch.exp(scales_all), dim=0))
+
             # Split scales for Level 1 and Level 2
             if len(points_level1) > 0:
                 scales_level1 = scales_all[:len(points_level1)]  # [n_level1, 3]
             else:
                 scales_level1 = torch.empty(0, 3, device=device)
+
+
+            dist2_avg_level1 = (knn(points_level1, 4)[:, 1:] ** 2).mean(dim=-1)  # [n_level1,]
+            dist_avg_level1 = torch.sqrt(dist2_avg_level1)
+            scales_level1 = torch.log(dist_avg_level1 * init_scale).unsqueeze(-1).repeat(1, 3)  # [n_level1, 3]
+            print(torch.min(scales_level1, dim=0), torch.max(scales_level1, dim=0))
+            print(torch.min(torch.exp(scales_level1), dim=0), torch.max(torch.exp(scales_level1), dim=0))
+
+            dist2_avg_level2 = (knn(points_level2, 4)[:, 1:] ** 2).mean(dim=-1)  # [n_level2,]
+            dist_avg_level2 = torch.sqrt(dist2_avg_level2)
+            scales_level2 = torch.log(dist_avg_level2 * init_scale).unsqueeze(-1).repeat(1, 3)  # [n_level2, 3]
+            print(torch.min(scales_level2, dim=0), torch.max(scales_level2, dim=0))
+            print(torch.min(torch.exp(scales_level2), dim=0), torch.max(torch.exp(scales_level2), dim=0))
+
+            scales_all = torch.cat([scales_level1, scales_level2], dim=0)  # [n_level1 + n_level2, 3]
+            print(torch.min(scales_all, dim=0), torch.max(scales_all, dim=0))
+            print(torch.min(torch.exp(scales_all), dim=0), torch.max(torch.exp(scales_all), dim=0))
+
         else:
             scales_level1 = torch.empty(0, 3, device=device)
             scales_all = torch.empty(0, 3, device=device)
@@ -212,120 +312,169 @@ class MultigridGaussians:
         rgbs_level1_dist = rgbs_level1
         
         n_level2 = len(points_level2)
+        
+        # Find closest Level 1 point for ALL Level 2 points (before distribution)
+        if n_level2 > 0 and len(points_level1) > 0:
+            closest_level1_indices_all = find_closest_points_chunked(
+                query_points=points_level2,  # All Level 2 points
+                reference_points=points_level1,  # All Level 1 points
+                chunk_size=5000,
+            )  # [n_level2] - indices into points_level1 (0 to n_level1-1)
+            
+            # Validate indices: should be in range [0, n_level1-1]
+            assert (closest_level1_indices_all >= 0).all() and (closest_level1_indices_all < n_level1).all(), \
+                f"Invalid parent indices: {closest_level1_indices_all.min().item()} to {closest_level1_indices_all.max().item()}, " \
+                f"expected range [0, {n_level1-1}]"
+            
+            # Convert all Level 2 absolute positions to relative (residual) BEFORE distribution
+            # This matches v5 behavior: convert to relative coordinates before distribution
+            # Get parent absolute positions for all Level 2 points
+            parent_absolute_means_all = points_level1[closest_level1_indices_all]  # [n_level2, 3]
+            # Apply position_scale_reduction: Level 2 has scale_factor = position_scale_reduction^(2-1) = position_scale_reduction
+            scale_factor_level2 = position_scale_reduction ** (2 - 1)  # Level 2 scale factor
+            points_level2_relative_all = (points_level2 - parent_absolute_means_all) / scale_factor_level2  # [n_level2, 3]
+        else:
+            closest_level1_indices_all = torch.empty(0, dtype=torch.long, device=device)
+            points_level2_relative_all = points_level2
+        
+        # Distribute points across ranks
         if n_level2 > 0:
-            # Level 2: Use scales from all points calculation
-            scales_level2_all = scales_all[len(points_level1):]  # [n_level2, 3]
+            points_level1_dist = points_level1  # All ranks get same Level 1
+            rgbs_level1_dist = rgbs_level1
+            scales_level1_dist = scales_level1
             
-            # Find closest Level 1 point for ALL Level 2 points (before distribution)
-            # This must be done BEFORE converting to relative coordinates and distribution
-            if len(points_level2) > 0 and len(points_level1) > 0:
-                # Find closest Level 1 point for each Level 2 point (using all Level 2 points)
-                closest_level1_indices_all = find_closest_points_chunked(
-                    query_points=points_level2,  # All Level 2 points
-                    reference_points=points_level1,  # All Level 1 points
-                    chunk_size=5000,
-                )  # [n_level2] - indices into points_level1 (0 to n_level1-1)
-                
-                # Validate indices: should be in range [0, n_level1-1]
-                assert (closest_level1_indices_all >= 0).all() and (closest_level1_indices_all < n_level1).all(), \
-                    f"Invalid parent indices: {closest_level1_indices_all.min().item()} to {closest_level1_indices_all.max().item()}, " \
-                    f"expected range [0, {n_level1-1}]"
-                
-                # Get parent absolute positions for all Level 2 points
-                parent_absolute_means_all = points_level1[closest_level1_indices_all]  # [n_level2, 3]
-                # Convert all Level 2 absolute positions to relative (residual)
-                # Apply position_scale_reduction: Level 2 has scale_factor = position_scale_reduction^(2-1) = position_scale_reduction
-                scale_factor_level2 = position_scale_reduction ** (2 - 1)  # Level 2 scale factor
-                points_level2_relative_all = (points_level2 - parent_absolute_means_all) / scale_factor_level2  # [n_level2, 3]
-            else:
-                # No Level 2 points to process
-                points_level2_relative_all = points_level2
-                closest_level1_indices_all = torch.empty(0, dtype=torch.long, device=device)
-            
-            # Now distribute Level 2 points (and their parent indices) across ranks
-            points_level2_dist = points_level2_relative_all[world_rank::world_size]  # Distributed relative coordinates
+            # Distribute already-converted relative coordinates
+            points_level2_dist = points_level2_relative_all[world_rank::world_size]
             rgbs_level2_dist = rgbs_level2[world_rank::world_size]
-            scales_level2 = scales_level2_all[world_rank::world_size]
-            closest_level1_indices = closest_level1_indices_all[world_rank::world_size]  # Distributed parent indices
+            scales_level2_dist = scales_all[len(points_level1):][world_rank::world_size]
+            closest_level1_indices = closest_level1_indices_all[world_rank::world_size]
             
             n_level1_distributed = n_level1
             n_level2_distributed = len(points_level2_dist)
             
-            # Validate distributed indices: should be in range [0, n_level1_distributed-1]
+            # Validate distributed indices
             if len(closest_level1_indices) > 0:
                 assert (closest_level1_indices >= 0).all() and (closest_level1_indices < n_level1_distributed).all(), \
                     f"Invalid distributed parent indices: {closest_level1_indices.min().item()} to {closest_level1_indices.max().item()}, " \
                     f"expected range [0, {n_level1_distributed-1}]"
+        else:
+            points_level1_dist = points_level1[world_rank::world_size]
+            rgbs_level1_dist = rgbs_level1[world_rank::world_size]
+            scales_level1_dist = scales_level1[world_rank::world_size]
             
-            # Combine distributed points: Level 1 (absolute) + Level 2 (relative)
+            n_level1_distributed = len(points_level1_dist)
+            n_level2_distributed = 0
+            closest_level1_indices = torch.empty(0, dtype=torch.long, device=device)
+        
+        # Combine Level 1 and Level 2 parameters
+        # Level 1: absolute coordinates, Level 2: already converted to relative coordinates
+        if n_level2 > 0:
             points = torch.cat([points_level1_dist, points_level2_dist], dim=0)
             rgbs = torch.cat([rgbs_level1_dist, rgbs_level2_dist], dim=0)
-            scales = torch.cat([scales_level1, scales_level2], dim=0)
+            scales = torch.cat([scales_level1_dist, scales_level2_dist], dim=0)
         else:
-            # No Level 2 points: only Level 1 points exist
-            points_level2_dist = torch.empty(0, 3, device=device)
-            rgbs_level2_dist = torch.empty(0, 3, device=device)
-            scales_level2 = torch.empty(0, 3, device=device)
-            closest_level1_indices = torch.empty(0, dtype=torch.long, device=device)
-            
-            # Distribute Level 1 points across ranks
-            # Note: scales_level1 is already calculated above with level1_scale_multiplier
-            points = points_level1_dist[world_rank::world_size]
-            rgbs = rgbs_level1_dist[world_rank::world_size]
-            scales = scales_level1[world_rank::world_size]
-            
-            n_level1_distributed = len(points)
-            n_level2_distributed = 0
+            points = points_level1_dist
+            rgbs = rgbs_level1_dist
+            scales = scales_level1_dist
         
         N = points.shape[0]
         
-        quats = torch.rand((N, 4))  # [N, 4]
-        # Opacities are independent parameters (not residual)
-        opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
-
-        # Initialize level and parent_index
+        # Initialize all parameters
+        torch.manual_seed(42)
+        quats = torch.rand((N, 4), device=device)
+        opacities = torch.logit(torch.full((N,), init_opacity, device=device))
+        
+        if feature_dim is None:
+            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3), device=device)
+            colors[:, 0, :] = rgb_to_sh(rgbs)
+        else:
+            features = torch.zeros(N, feature_dim, device=device)
+            colors = torch.zeros(N, 3, device=device)
+            if n_level2 > 0:
+                features[:n_level1_distributed] = torch.rand(n_level1_distributed, feature_dim, device=device)
+                colors[:n_level1_distributed] = torch.logit(rgbs[:n_level1_distributed])
+                colors[n_level1_distributed:] = torch.logit(rgbs[n_level1_distributed:])
+            else:
+                features = torch.rand(N, feature_dim, device=device)
+                colors = torch.logit(rgbs)
+        
+        # Initialize levels and parent_indices
         if n_level2 > 0:
-            # Hierarchical structure: Level 1 and Level 2
-            # Level 1: indices [0, n_level1_distributed-1], parent = -1 (root)
-            # Level 2: indices [n_level1_distributed, N-1], parent = closest Level 1 point
             levels = torch.ones(N, dtype=torch.long, device=device)
-            levels[:n_level1_distributed] = 1  # Level 1
-            levels[n_level1_distributed:] = 2  # Level 2
+            levels[:n_level1_distributed] = 1
+            levels[n_level1_distributed:] = 2
             
             parent_indices = torch.full((N,), -1, dtype=torch.long, device=device)
-            # Level 1 has no parent (root nodes)
-            # Level 2 points: assign parent to closest Level 1 point
             if n_level2_distributed > 0:
                 parent_indices[n_level1_distributed:] = closest_level1_indices
         else:
-            # No Level 2 points: all points are Level 1 (root nodes)
-            levels = torch.ones(N, dtype=torch.long, device=device)  # All Level 1
-            parent_indices = torch.full((N,), -1, dtype=torch.long, device=device)  # All root nodes
-
+            levels = torch.ones(N, dtype=torch.long, device=device)
+            parent_indices = torch.full((N,), -1, dtype=torch.long, device=device)
+        
+        # Initialize level_indices structure
+        self.level_indices: Dict[int, List[int]] = {}
+        level1_indices_tensor = torch.where(levels == 1)[0]  # Tensor for indexing
+        level2_indices_tensor = torch.where(levels == 2)[0]  # Tensor for indexing
+        level1_indices = level1_indices_tensor.cpu().tolist()
+        level2_indices = level2_indices_tensor.cpu().tolist()
+        self.level_indices[1] = level1_indices
+        if len(level2_indices) > 0:
+            self.level_indices[2] = level2_indices
+        
+        # Convert Level 2 parameters to relative (residual) using level_indices
+        # Note: means are already converted to relative coordinates before distribution
+        # So we only need to convert other parameters (scales, quats, opacities, colors)
+        if len(level2_indices_tensor) > 0:
+            
+            # scales: set to 0 (residual) - in-place operation
+            level2_scales = scales[level2_indices_tensor]
+            parent_scales = scales[parent_indices[level2_indices_tensor]]
+            level2_scales = level2_scales - parent_scales + 0.6931
+            scales[level2_indices_tensor] = level2_scales
+            
+            # quats: set to identity quaternion (residual) - in-place operation
+            quats[level2_indices_tensor] = 0
+            quats[level2_indices_tensor, 0] = 1.0  # w component = 1.0 for identity quaternion
+            
+            # opacities: set to 0 (residual) - in-place operation
+            opacities[level2_indices_tensor] = 0
+            
+            # sh0, shN or features, colors: convert to residual by subtracting parent values (in-place)
+            if feature_dim is None:
+                # colors: child_residual = child_absolute - parent_absolute
+                parent_colors = colors[parent_indices[level2_indices_tensor]]  # [n_level2, K, 3]
+                colors[level2_indices_tensor].sub_(parent_colors)  # In-place subtraction
+            else:
+                # features and colors: child_residual = child_absolute - parent_absolute
+                parent_features = features[parent_indices[level2_indices_tensor]]  # [n_level2, feature_dim]
+                parent_colors = colors[parent_indices[level2_indices_tensor]]  # [n_level2, 3]
+                features[level2_indices_tensor].sub_(parent_features)  # In-place subtraction
+                colors[level2_indices_tensor].sub_(parent_colors)  # In-place subtraction
+        
+        # Create parameter dictionary
         params = [
-            # name, value, lr
-            # Note: Level 1 means are absolute, Level 2+ means are relative to parent
-            ("means", torch.nn.Parameter(points), means_lr * scene_scale),
-            ("scales", torch.nn.Parameter(scales), scales_lr),
-            ("quats", torch.nn.Parameter(quats), quats_lr),
-            ("opacities", torch.nn.Parameter(opacities), opacities_lr),
+            ("means", torch.nn.Parameter(points.detach().float()), means_lr * scene_scale),
+            ("scales", torch.nn.Parameter(scales.detach().float()), scales_lr),
+            ("quats", torch.nn.Parameter(quats.detach().float()), quats_lr),
+            ("opacities", torch.nn.Parameter(opacities.detach().float()), opacities_lr),
         ]
-
+        
         if feature_dim is None:
-            # color is SH coefficients.
-            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-            colors[:, 0, :] = rgb_to_sh(rgbs)
-            params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-            params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+            params.append(("sh0", torch.nn.Parameter(colors[:, :1, :].detach().float().contiguous()), sh0_lr))
+            params.append(("shN", torch.nn.Parameter(colors[:, 1:, :].detach().float().contiguous()), shN_lr))
         else:
-            # features will be used for appearance and view-dependent shading
-            features = torch.rand(N, feature_dim)  # [N, feature_dim]
-            params.append(("features", torch.nn.Parameter(features), sh0_lr))
-            colors = torch.logit(rgbs)  # [N, 3]
-            params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
+            params.append(("features", torch.nn.Parameter(features.detach().float()), sh0_lr))
+            params.append(("colors", torch.nn.Parameter(colors.detach().float()), sh0_lr))
+
+        
 
         splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
         
+        # for k, v in splats.items():
+        #     print(k, v.shape, v.dtype, v.is_contiguous()) 
+        #     #print v's layout? is contiguous?
+
+
         # Scale learning rate based on batch size
         BS = batch_size * world_size
         optimizer_class = None
@@ -347,15 +496,6 @@ class MultigridGaussians:
             for name, _, lr in params
         }
         
-        # Initialize level_indices structure
-        # level_indices[level] = list of gaussian indices at that level
-        self.level_indices: Dict[int, List[int]] = {}
-        level1_indices = torch.where(levels == 1)[0].cpu().tolist()
-        level2_indices = torch.where(levels == 2)[0].cpu().tolist()
-        self.level_indices[1] = level1_indices
-        if len(level2_indices) > 0:
-            self.level_indices[2] = level2_indices
-        
         # Store as instance attributes
         self.splats = splats
         self.optimizers = optimizers
@@ -369,17 +509,118 @@ class MultigridGaussians:
         # Maximum level for hierarchical structure
         # If set, gaussians at max_level will only duplicate (not split) even if split conditions are met
         self.max_level = max_level
+        
+        # Track last render level for optimization (not for caching)
+        self._last_render_level = None
     
-    def get_splats(self, level: Optional[int] = None, detach_parents: bool = False) -> Dict[str, Tensor]:
+    @staticmethod
+    def restrict_parameters(
+        child_params: Dict[str, Tensor],
+        parent_indices: Tensor,
+        child_levels: Tensor,
+        position_scale_reduction: float,
+        parent_levels: Tensor,
+    ) -> Dict[str, Tensor]:
+        """
+        Restrict child parameter changes to parent parameters.
+        
+        This implements the restriction operation in multigrid:
+        - Accumulates child parameter changes and averages them for each parent
+        - Handles special cases: means (scaling), scales (-0.6931), quats (quaternion multiplication)
+        - Note: parent_level = child_level - 1 (always), so we don't need parent_level parameter
+        
+        Args:
+            child_params: Dictionary of child parameter changes {param_name: [N_child, ...]}
+            parent_indices: Parent index for each child [N_child,]
+            child_levels: Level of each child [N_child,]
+            position_scale_reduction: Scale reduction factor for hierarchical means
+        
+        Returns:
+            Dictionary of parent parameter changes {param_name: [N_parent, ...]}
+        """
+        if len(parent_indices) == 0:
+            # No children, return empty dict
+            return {k: torch.zeros_like(v[:0]) for k, v in child_params.items()}
+        
+        # Get max parent index
+        valid_mask = (parent_indices >= 0)
+        if not valid_mask.any():
+            # No valid parents, return empty dict
+            return {k: torch.zeros_like(v[:0]) for k, v in child_params.items()}
+        
+        max_parent_idx = parent_indices[valid_mask].max().item()
+        N_parent = max_parent_idx + 1
+        
+        valid_parent_levels = parent_levels[valid_mask]
+
+        # Count number of children per parent (for averaging)
+        child_count = torch.zeros(N_parent, dtype=torch.float, device=parent_indices.device)
+        child_count.scatter_add_(0, parent_indices[valid_mask], torch.ones(valid_mask.sum(), dtype=torch.float, device=parent_indices.device))
+        child_count = child_count.clamp_min(1.0)  # Avoid division by zero
+        
+        parent_deltas = {}
+        for param_name, child_delta in child_params.items():
+            # Convert child delta to parent delta (handles scaling, quaternion, etc.)
+            # Note: parent_level = child_level - 1 (always), so we don't need parent_level parameter
+            parent_delta_per_child = child_to_parent_delta(
+                child_delta=child_delta[valid_mask],
+                param_name=param_name,
+                child_levels=child_levels[valid_mask],
+                position_scale_reduction=position_scale_reduction,
+                parent_levels=valid_parent_levels,
+            )
+            
+            # Initialize parent delta tensor
+            if param_name == "quats":
+                parent_delta_shape = (N_parent, 4)
+            elif param_name in ["means", "scales"]:
+                parent_delta_shape = (N_parent, child_delta.shape[1])
+            elif param_name == "opacities":
+                parent_delta_shape = (N_parent,)
+            else:  # sh0, shN, etc.
+                parent_delta_shape = (N_parent, *child_delta.shape[1:])
+            
+            parent_delta = torch.zeros(parent_delta_shape, dtype=child_delta.dtype, device=child_delta.device)
+            
+            # Accumulate child deltas to parents
+            valid_parent_indices = parent_indices[valid_mask]
+            if param_name == "opacities":
+                parent_delta.scatter_add_(0, valid_parent_indices, parent_delta_per_child)
+            elif param_name in ["means", "scales", "quats"]:
+                parent_delta.scatter_add_(0, valid_parent_indices.unsqueeze(-1).expand(-1, parent_delta_per_child.shape[1]), parent_delta_per_child)
+            else:  # sh0, shN, etc. (multi-dimensional)
+                expand_dims = [valid_parent_indices.shape[0]] + [1] * (parent_delta_per_child.dim() - 1)
+                indices_expanded = valid_parent_indices.view(expand_dims).expand_as(parent_delta_per_child)
+                parent_delta.scatter_add_(0, indices_expanded, parent_delta_per_child)
+            
+            # Average by number of children
+            if param_name == "opacities":
+                parent_delta = parent_delta / child_count
+            elif param_name in ["means", "scales", "quats"]:
+                parent_delta = parent_delta / child_count.unsqueeze(-1)
+            else:  # sh0, shN, etc.
+                parent_delta = parent_delta / child_count.view(-1, *([1] * (parent_delta.dim() - 1)))
+            
+            # Normalize quaternions
+            if param_name == "quats":
+                parent_delta = F.normalize(parent_delta, p=2, dim=-1)
+            
+            parent_deltas[param_name] = parent_delta
+        
+        return parent_deltas
+    
+    def get_splats(self, level: Optional[int] = None, detach_parents: bool = False, current_splats: Optional[Dict[str, Tensor]] = None) -> Dict[str, Tensor]:
         """
         Get splats with hierarchical structure applied.
         
+        All parameters are now residual:
         - Level 1 gaussians: Use their own parameters directly
         - Level 2+ gaussians: 
           * means: parent mean + (child residual * scale_factor) - residual with position scaling
-          * scales, quats: use child's own parameters directly (independent, not residual)
-          * opacities: parent opacity + child residual (residual parameter, like means, sh0, shN)
-          * sh0, shN, etc.: parent parameter + child residual - residual
+          * scales: parent scale + child residual (initialized as 원래 scales - parent_scales + 0.6931, so final = 원래 scales + 0.6931)
+          * quats: parent quat * child residual quat (quaternion multiplication)
+          * opacities: parent opacity + child residual
+          * sh0, shN, etc.: parent parameter + child residual
         
         Args:
             level: If specified, only return splats for gaussians at this level.
@@ -388,17 +629,20 @@ class MultigridGaussians:
                           This prevents parent parameters from receiving gradients when
                           leaf nodes are being trained. Useful for V-cycle training where
                           we want to train leaf nodes independently.
+            current_splats: Optional dict of current splat parameters to use instead of self.splats.
+                          If None, uses self.splats. Always computes using current values to reflect
+                          optimization updates.
         
         Returns:
-            Dict[str, Tensor] with processed splats where:
-            - means: hierarchical structure applied (parent + child residual * scale_factor)
-            - scales, quats, opacities: independent parameters (child's own values)
-            - sh0, shN: residual parameters (parent + child residual)
-            - sh0, shN, etc.: hierarchical structure applied (parent + child residual)
+            Dict[str, Tensor] with processed splats where all parameters are residual.
             Note: Returns plain tensors (not ParameterDict) to preserve gradient flow.
         """
-        device = self.splats["means"].device
-        N = self.splats["means"].shape[0]
+        # Determine which splats to use (current_splats if provided, otherwise self.splats)
+        # Always compute using current splats to reflect optimization updates
+        splats_to_use = current_splats if current_splats is not None else self.splats
+        
+        device = splats_to_use["means"].device
+        N = splats_to_use["means"].shape[0]
         
         # Determine which gaussians to process
         if level is not None:
@@ -408,8 +652,8 @@ class MultigridGaussians:
             if len(indices) == 0:
                 # Return empty splats if no gaussians at this level
                 return {
-                    name: torch.empty((0, *param.shape[1:]), device=device, dtype=param.dtype)
-                    for name, param in self.splats.items()
+                    name: torch.empty((0, *splats_to_use[name].shape[1:]), device=device, dtype=splats_to_use[name].dtype)
+                    for name in splats_to_use.keys()
                 }
         else:
             # Process all gaussians
@@ -420,14 +664,11 @@ class MultigridGaussians:
         max_level = int(self.levels.max().item()) if len(indices) > 0 else 1
         
         # Store final parameters for all gaussians (for efficient lookup)
-        # Use v + 0 to preserve gradients and create a view that tracks gradients
-        # This creates a new tensor that shares the computation graph with the original
-        # Note: v + 0 preserves gradients better than clone()
-        # final_params = {k: v + 0 for k, v in self.splats.items()}
         # Initialize with zeros - we'll accumulate parameters level by level
-        # This is more memory efficient than cloning all parameters upfront
-        final_params = {k: torch.zeros_like(v) for k, v in self.splats.items()}
+        # Always use current splats_to_use (which may be current_splats or self.splats)
+        final_params = {k: torch.zeros_like(v) for k, v in splats_to_use.items()}
         
+
         # Process level by level: start from level 1 and go up
         # Level 1: root nodes, use their own parameters directly
         # Level 2+: accumulate parent's final parameter + child residual
@@ -448,14 +689,9 @@ class MultigridGaussians:
             has_parent_mask = (parent_ids != -1)
             
             if is_level1:
-                # Level 1: root nodes - use their own parameters directly
+                # Level 1: root nodes - use their own parameters directly (all are absolute, not residual)
                 for name in final_params.keys():
-                    if name in ["scales", "quats", "opacities"]:
-                        # Independent parameters: use child's own values
-                        final_params[name][curr_indices] = self.splats[name][curr_indices]
-                    else:
-                        # Residual parameters (means, sh0, shN): Level 1 uses own values (no parent)
-                        final_params[name][curr_indices] = self.splats[name][curr_indices]
+                    final_params[name][curr_indices] = splats_to_use[name][curr_indices]
             else:
                 # Level 2+: has parent - accumulate parent + child residual
                 if not has_parent_mask.any():
@@ -473,31 +709,43 @@ class MultigridGaussians:
                     if name == "means":
                         # For means (positions), apply level-based scale reduction
                         # Higher level = smaller scale, keeping children closer to parents
-                        scale_factor = self.position_scale_reduction ** (valid_curr_levels.float() - 1)
-                        scale_factor = scale_factor.unsqueeze(-1)  # [N_valid, 1] for broadcasting
                         # Get parent's final parameter (already accumulated from lower levels)
                         parent_means = final_params[name][valid_parent_ids]
                         if detach_parents:
                             parent_means = parent_means.detach()
+                        # Calculate scale_factor based on level: position_scale_reduction^(level-1)
+                        # Level 2: position_scale_reduction^(2-1) = position_scale_reduction
+                        # Level 3: position_scale_reduction^(3-1) = position_scale_reduction^2
+                        scale_factor = self.position_scale_reduction ** (valid_curr_levels.float() - 1)
+                        scale_factor = scale_factor.unsqueeze(-1)  # [N_valid, 1] for broadcasting
                         # Child mean = parent mean + (child residual * scale_factor)
-                        child_residual = self.splats[name][valid_curr_indices]  # Get from original splats
+                        child_residual = splats_to_use[name][valid_curr_indices]  # Get from current splats
                         final_params[name][valid_curr_indices] = (
                             parent_means + 
                             child_residual * scale_factor
                         )
                         # Free intermediate tensors
                         del parent_means, child_residual, scale_factor
-                    elif name in ["scales", "quats", "opacities"]:
-                        # Independent parameters: use child's own values directly
-                        final_params[name][valid_curr_indices] = self.splats[name][valid_curr_indices]
+                    elif name == "scales":
+                        # Scales: parent scale + child residual - 0.6931 (in log space)
+                        # This makes child scale approximately 50% of parent (exp(-0.6931) ≈ 0.5)
+                        # parent + residual - 0.6931 means child = parent - 0.6931 + residual
+                        # If residual = 0, child = parent - 0.6931, which is exp(parent - 0.6931) = exp(parent) * exp(-0.6931) ≈ exp(parent) * 0.5
+                        parent_scales = final_params[name][valid_parent_ids]  # [N_valid, 3] - already in log space
+                        if detach_parents:
+                            parent_scales = parent_scales.detach()
+                        child_residual = splats_to_use[name][valid_curr_indices]  # [N_valid, 3] - residual in log space
+                        final_params[name][valid_curr_indices] = parent_scales + child_residual - 0.6931
+                        # Free intermediate tensors
+                        del parent_scales, child_residual
                     else:
-                        # For residual parameters (means, sh0, shN), add parent's final parameter to current residual
+                        # For other residual parameters (opacities, sh0, shN), add parent's final parameter to current residual
                         # Get parent's final parameter (already accumulated from lower levels)
                         parent_params = final_params[name][valid_parent_ids]
                         if detach_parents:
                             parent_params = parent_params.detach()
-                        # Child residual from original splats
-                        child_residual = self.splats[name][valid_curr_indices]
+                        # Child residual from current splats
+                        child_residual = splats_to_use[name][valid_curr_indices]
                         final_params[name][valid_curr_indices] = (
                             parent_params + child_residual
                         )
@@ -519,6 +767,11 @@ class MultigridGaussians:
             torch.cuda.empty_cache()
         
         return output_tensors
+    
+    def invalidate_splats_cache(self):
+        """Invalidate cache (no-op now, kept for compatibility). Call this after densification operations."""
+        # Cache is removed, but keep this method for compatibility
+        self._last_render_level = None
     
     def set_visible_mask(self, level: int) -> Tensor:
         """
@@ -590,7 +843,6 @@ class MultigridGaussians:
         distributed: bool = False,
         with_ut: bool = False,
         with_eval3d: bool = False,
-        backgrounds: Optional[Tensor] = None,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
         """
@@ -684,13 +936,18 @@ class MultigridGaussians:
         # When rendering at a specific level, we want to train leaf nodes independently,
         # so we detach parent parameters from the computation graph
         # This prevents parent parameters from receiving gradients when leaf nodes are trained
-        visible_splats = self.get_splats(level=None, detach_parents=True)  # Get all splats with hierarchy applied, detach parents
+        # Always use current self.splats (optimized values) - no caching during optimization
+        visible_splats = self.get_splats(level=None, detach_parents=True, current_splats=None)
+        self._last_render_level = render_level  # Update last render level (for tracking only)
         
         # Extract visible splats - this indexing preserves gradients
         visible_means = visible_splats["means"][visible_indices]  # [N_visible, 3]
         visible_quats = visible_splats["quats"][visible_indices]  # [N_visible, 4]
         visible_scales = visible_splats["scales"][visible_indices]  # [N_visible, 3]
         visible_opacities = visible_splats["opacities"][visible_indices]  # [N_visible,]
+        
+        
+        # print(visible_opacities.min().item(), visible_opacities.max().item(), visible_opacities.mean().item())
         
         # Extract colors before freeing visible_splats
         image_ids = kwargs.pop("image_ids", None)
@@ -714,6 +971,22 @@ class MultigridGaussians:
         scales = torch.exp(visible_scales)  # [N_visible, 3]
         opacities = torch.sigmoid(visible_opacities)  # [N_visible,]
         
+        # if not render_level == 1:
+        #     import matplotlib
+        #     matplotlib.use("Agg")
+        #     import matplotlib.pyplot as plt
+        #     # make histogram of opacities
+        #     plt.figure()
+        #     plt.hist(opacities.cpu().data.numpy(), bins=100)
+        #     plt.savefig("opacities_v6.png")
+        #     plt.close()
+        #     # make histogram of scales
+        #     plt.figure()
+        #     plt.hist(scales.cpu().data.numpy(), bins=100)
+        #     plt.savefig("scales_v6.png")
+        #     plt.close()
+        #     exit()
+
         # Free intermediate tensors
         del visible_means, visible_quats, visible_scales, visible_opacities
 
