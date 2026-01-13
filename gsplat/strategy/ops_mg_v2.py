@@ -407,7 +407,7 @@ def create_children_mg(
     )  # [n_children_per_split, N, 3]
     # Scale down samples to be small residual offsets
     # Use small scale factor to keep children close to parent initially
-    small_scale_factor = 0.01  # Small scale for residual means
+    small_scale_factor = 0.002  # Small scale for residual means
     samples = samples * small_scale_factor  # [n_children_per_split, N, 3]
 
     # Get parent levels and compute child levels (after sel validation)

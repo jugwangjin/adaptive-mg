@@ -106,7 +106,7 @@ def get_result_directories() -> Dict[str, Optional[str]]:
     # result['vc_v2'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_v2"
     # result['vc_v3'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_v3"
     # result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_vcycle/garden_type_colmap_factor_8_v1"
-    result['inv_fcycle'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_inv_fcycle/garden_type_colmap_factor_8_v6_randbkgd"
+    result['inv_fcycle'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_inv_fcycle/garden_type_colmap_factor_8_v8_randbkgd"
 
     # if vcycle_dir:
     #     result['vcycle'] = vcycle_dir
@@ -194,17 +194,15 @@ def plot_metric_on_axis(
         for name, data in all_data.items()
         if metric_name in data and len(data[metric_name]) > 0
     }
+
     
     if not methods_with_data:
         ax.text(0.5, 0.5, f'No data for {metric_name}', 
                 ha='center', va='center', transform=ax.transAxes)
         return
     
-    # Get all unique steps
-    all_steps = set()
-    for data in methods_with_data.values():
-        all_steps.update(data.keys())
-    all_steps = sorted(all_steps)
+    # Debug: Print step information
+    print(f"\n  Debug for {metric_name}:")
     
     # Color and marker styles for different methods
     styles = {
@@ -219,17 +217,27 @@ def plot_metric_on_axis(
     
     # Plot each method
     for method_name, method_data in methods_with_data.items():
-        # For ellipse_time, only plot steps that have data (don't fill with NaN)
-        if metric_name == 'ellipse_time':
-            steps_with_data = sorted(method_data.keys())
-            values = [method_data[step] for step in steps_with_data]
-            style, color, label = styles.get(method_name, ('o-', 'gray', method_name))
-            ax.plot(steps_with_data, values, linewidth=2, markersize=4, alpha=0.8, label=label)
-        else:
-            values = [method_data.get(step, np.nan) for step in all_steps]
-            style, color, label = styles.get(method_name, ('o-', 'gray', method_name))
-            ax.plot(all_steps, values, linewidth=2, markersize=4, alpha=0.8, label=label)
-        # ax.plot(all_steps, values, style, label=label, linewidth=2, markersize=4, alpha=0.8, color=color)
+        style, _, label = styles.get(method_name, ('o-', 'gray', method_name))
+        
+        # Debug: Print method-specific data
+        method_steps = sorted(method_data.keys())
+        print(f"    {method_name}: {len(method_steps)} data points")
+        if len(method_steps) > 0:
+            print(f"      Steps: {method_steps[:5]}..." if len(method_steps) > 5 else f"      Steps: {method_steps}")
+        
+        # Plot using only steps that have data for this method (no NaN filling)
+        # This prevents graph breaks when different methods have different evaluation steps
+        steps_with_data = sorted(method_data.keys())
+        values = [method_data[step] for step in steps_with_data]
+        
+        if len(steps_with_data) > 0:
+            # Check for gaps in steps
+            if len(steps_with_data) > 1:
+                gaps = [steps_with_data[i+1] - steps_with_data[i] for i in range(len(steps_with_data)-1)]
+                if max(gaps) > min(gaps) * 2:
+                    print(f"      WARNING: Large gaps detected in {method_name} steps (max gap: {max(gaps)})")
+            ax.plot(steps_with_data, values, label=label, 
+                   linewidth=2, markersize=4, alpha=0.8, marker='o')
     
     # Formatting
     ax.set_xlabel('Training Step', fontsize=11)
@@ -298,6 +306,7 @@ def main():
         metrics = parse_stats_files(Path(dir_path))
         if metrics:
             all_data[name] = metrics
+            print(metrics)
             print(f"    Found metrics: {list(metrics.keys())}")
             for metric_name, metric_data in metrics.items():
                 print(f"      {metric_name}: {len(metric_data)} data points")
