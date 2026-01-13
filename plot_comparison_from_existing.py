@@ -106,7 +106,7 @@ def get_result_directories() -> Dict[str, Optional[str]]:
     # result['vc_v2'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_v2"
     # result['vc_v3'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_v3"
     # result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_vcycle/garden_type_colmap_factor_8_v1"
-    result['inv_fcycle'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_inv_fcycle/garden_type_colmap_factor_8_v8_randbkgd"
+    result['inv_fcycle'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_inv_fcycle/garden_type_colmap_factor_8_v10_randbkgd"
 
     # if vcycle_dir:
     #     result['vcycle'] = vcycle_dir

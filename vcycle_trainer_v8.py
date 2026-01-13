@@ -137,7 +137,7 @@ class Config:
     eval_cycles: List[int] = field(default_factory=lambda: [])
     # Interval for metric measurement (every N cycles). -1 means disable metric measurement.
     # Evaluation is performed at the end of each cycle, not during cycle execution.
-    metric_interval_cycles: int = 5
+    metric_interval_cycles: int = 3
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [30_000])
     # Whether to save ply file (storage size can be large)
@@ -223,9 +223,10 @@ class Config:
     cycle_type: Literal["vcycle", "inv_fcycle"] = "inv_fcycle"
     
     # V-cycle parameters
-    smoothing_steps: int = 16  # Number of smoothing steps per level (fixed at 100 for V-cycle)
-    solving_steps: int = 16  # Number of solving steps at coarsest level (fixed at 100 for V-cycle)
-    steps_decaying_per_level: float = 0.75
+    smoothing_steps: int = 8  # Number of smoothing steps per level (fixed at 100 for V-cycle)
+    solving_steps: int = 32  # Number of solving steps at coarsest level (fixed at 100 for V-cycle)
+    steps_decaying_per_level: float = 1
+    restriction_dampling: float = 0.5
     
     # Strategy parameters (set based on cycle_type in __post_init__)
     # For V-cycle: reset_every=60, refine_every=2, pause_refine_after_reset=2
@@ -308,7 +309,7 @@ class Config:
             settings_parts = [
                 f"type_{self.dataset_type}",
                 f"factor_{self.data_factor}",
-                "v8",
+                "v10",
             ]
             if self.dataset_type == "nerf" and self.white_background:
                 settings_parts.append("whitebg")
@@ -557,7 +558,7 @@ def vcycle_recursive(
         # All parameters are now residual: means, scales, quats, opacities, sh0, shN
         child_deltas = {}
         for key in param_keys:
-            child_deltas[key] = final_splats[key][valid_indices] - initial_params[key]
+            child_deltas[key] = (final_splats[key][valid_indices] - initial_params[key]) * cfg.restriction_dampling
         
         # Free intermediate tensors
         del final_splats
@@ -580,10 +581,11 @@ def vcycle_recursive(
         # Apply parent deltas to parent parameters
         for key in param_keys:
             # For other parameters: parent_param_new = parent_param_old + parent_delta
-            runner.splats[key].data[valid_parent_indices] += parent_deltas[key][valid_parent_indices]
+            runner.splats[key].data[valid_parent_indices] += parent_deltas[key][valid_parent_indices] 
         
         # Subtract changes from fine level parameters (to maintain optimized hierarchical values)
         # This ensures that fine level still renders with optimized values after restriction
+        # Note: child_deltas already has damping applied (line 561), so don't apply damping again
         for key in param_keys:
             if key == "means":
                 # For means, we need to compensate for parent's movement to maintain absolute position
@@ -591,11 +593,12 @@ def vcycle_recursive(
                 scale_factor = runner.multigrid_gaussians.position_scale_reduction ** (valid_child_levels.float() - 1)
                 scale_factor = scale_factor.unsqueeze(-1)  # [K, 1] for broadcasting
                 
-                # Get parent_delta for each child's parent
+                # child_deltas already has damping applied, so just divide by scale_factor
                 runner.splats[key].data[valid_indices] -= child_deltas[key] / scale_factor.clamp_min(1e-8)
                 del scale_factor
             else:
                 # For other parameters (including quats): child_residual_new = child_residual_old - child_delta
+                # child_deltas already has damping applied, so use it directly
                 # Quats use addition (normalize will be applied later)
                 runner.splats[key].data[valid_indices] -= child_deltas[key]
         
@@ -1855,14 +1858,14 @@ class Runner:
                 self.multigrid_gaussians.parent_indices = self.strategy_state["parent_indices"]
                 self.multigrid_gaussians.level_indices = self.strategy_state["level_indices"]
             
-            # Save visualization at the end of each cycle
+            # Save visualization at the end of each cycle (if interval matches)
             # Use last_step_in_cycle for visualization step number
             last_step_in_cycle = current_step - 1 if current_step > 0 else 0
-            if cfg.visualization_interval > 0:
+            if cfg.visualization_interval > 0 and vcycle_idx % cfg.visualization_interval == 0:
                 self.save_visualization(last_step_in_cycle)
             
-            # Save hierarchy visualization at the end of each cycle
-            if cfg.hierarchy_visualization_interval > 0:
+            # Save hierarchy visualization at the end of each cycle (if interval matches)
+            if cfg.hierarchy_visualization_interval > 0 and vcycle_idx % cfg.hierarchy_visualization_interval == 0:
                 self.save_hierarchy_visualization(last_step_in_cycle)
             
             # Measure metrics at the end of each cycle (lightweight, no image saving)

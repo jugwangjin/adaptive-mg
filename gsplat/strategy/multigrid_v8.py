@@ -53,7 +53,7 @@ class MultigridStrategy(Strategy):
     prune_opa: float = 0.005
     coarsest_grow_grad2d: float = 0.0002 # Base gradient threshold (level 1)
     finest_grow_grad2d: float = 0.0002
-    grow_color: float = 0.00094
+    grow_color: float = 9999.
     grow_scale3d: float = 0.01
     grow_scale2d: float = 0.05
     prune_scale3d: float = 0.1
