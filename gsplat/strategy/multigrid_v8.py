@@ -53,7 +53,7 @@ class MultigridStrategy(Strategy):
     prune_opa: float = 0.005
     coarsest_grow_grad2d: float = 0.0002 # Base gradient threshold (level 1)
     finest_grow_grad2d: float = 0.0002
-    grow_color: float = 9999.
+    grow_color: float = 0.0003
     grow_scale3d: float = 0.01
     grow_scale2d: float = 0.05
     prune_scale3d: float = 0.1
@@ -72,7 +72,7 @@ class MultigridStrategy(Strategy):
     n_children_per_split: int = 4  # Number of children to create per split
     max_children_per_parent: int = 5  # Maximum number of children a parent can have
     max_level: int = 5  # Maximum level in the hierarchy
-    use_gradient_inheritance: bool = False  # Enable gradient inheritance from parent to children
+    use_gradient_inheritance: bool = True  # Enable gradient inheritance from parent to children
 
     def initialize_state(self, scene_scale: float = 1.0, levels: Tensor = None, parent_indices: Tensor = None, level_indices: Dict[int, List[int]] = None, max_level: Optional[int] = None, multigrid_gaussians: Optional[Any] = None) -> Dict[str, Any]:
         """Initialize and return the running state for this strategy.
@@ -746,13 +746,21 @@ class MultigridStrategy(Strategy):
                         # This gives larger children more gradient proportional to their size
                         # Normalize by num_child to distribute parent gradient evenly among children
                         inherited_grad_visible = ((parent_grads_visible / parent_radii_visible) * child_radii_visible) / parent_n_child_visible  # [K_visible,]
+
+                        parents_grads_color_visible = color_grads[valid_parents[visible_mask]]  # [K_visible,]
+                        parents_n_child_visible = n_child[valid_parents[visible_mask]].float().clamp_min(1.0)  # [K_visible,] - number of children per parent
+                        inherited_grad_color_visible = ((parents_grads_color_visible / parent_radii_visible) * child_radii_visible) / parents_n_child_visible  # [K_visible,]  
                         
                         # Initialize inherited_grad with zeros, then fill in visible ones
                         inherited_grad = torch.zeros_like(parent_grads)  # [K,]
                         inherited_grad[visible_mask] = inherited_grad_visible
+
+                        inherited_grad_color = torch.zeros_like(parent_grads)  # [K,]
+                        inherited_grad_color[visible_mask] = inherited_grad_color_visible
                         
                         # Add inherited gradient to children
                         grads[valid_children] += inherited_grad
+                        color_grads[valid_children] += inherited_grad_color
         
         # Compute target_level-based gradient thresholds using linear interpolation
         # Base threshold from target_level: Higher target_level (finest) -> lower base threshold

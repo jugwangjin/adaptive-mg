@@ -137,7 +137,7 @@ class Config:
     eval_cycles: List[int] = field(default_factory=lambda: [])
     # Interval for metric measurement (every N cycles). -1 means disable metric measurement.
     # Evaluation is performed at the end of each cycle, not during cycle execution.
-    metric_interval_cycles: int = 3
+    metric_interval_cycles: int = 6
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [30_000])
     # Whether to save ply file (storage size can be large)
@@ -223,10 +223,10 @@ class Config:
     cycle_type: Literal["vcycle", "inv_fcycle"] = "inv_fcycle"
     
     # V-cycle parameters
-    smoothing_steps: int = 32  # Number of smoothing steps per level (fixed at 100 for V-cycle)
-    solving_steps: int = 32  # Number of solving steps at coarsest level (fixed at 100 for V-cycle)
-    steps_decaying_per_level: float = 0.5
-    restriction_dampling: float = 1
+    smoothing_steps: int = 25  # Number of smoothing steps per level (fixed at 100 for V-cycle)
+    solving_steps: int = 25  # Number of solving steps at coarsest level (fixed at 100 for V-cycle)
+    steps_decaying_per_level: float = 0.8
+    restriction_dampling: float = 0.5
     
     # Strategy parameters (set based on cycle_type in __post_init__)
     # For V-cycle: reset_every=60, refine_every=2, pause_refine_after_reset=2
@@ -284,10 +284,10 @@ class Config:
 
     # Visualization: save visualization images (GT vs render) at the end of each cycle
     # If > 0, saves visualization after each cycle completion
-    visualization_interval: int = 1  # 1 = every cycle, 0 = disabled
+    visualization_interval: int = 2   # 1 = every cycle, 0 = disabled
     # Visualization: save hierarchy visualization (level pointclouds and linesets) at the end of each cycle
     # If > 0, saves hierarchy visualization after each cycle completion
-    hierarchy_visualization_interval: int = 30  # 1 = every cycle, 0 = disabled
+    hierarchy_visualization_interval: int = 60  # 1 = every cycle, 0 = disabled
 
     def __post_init__(self):
         """Auto-generate result_dir if not provided and set strategy parameters based on cycle_type."""
@@ -321,7 +321,7 @@ class Config:
                 settings_parts.append(f"patch_{self.patch_size}")
             
             settings_str = "_".join(settings_parts)
-            self.result_dir = f"/Bean/log/gwangjin/2025/gsplat/multigrid_{self.cycle_type}/{dataset_name}_{settings_str}"
+            self.result_dir = f"/Bean/log/gwangjin/2025/gsplat/hyphen_{self.cycle_type}/{dataset_name}_{settings_str}"
         
         # Set strategy parameters based on cycle_type if not explicitly provided
         if self.reset_every is None:
@@ -331,6 +331,7 @@ class Config:
                 self.reset_every = 30
             else:
                 raise ValueError(f"Unknown cycle_type: {self.cycle_type}")
+            self.reset_every = 120
         
         if self.refine_every is None:
             if self.cycle_type == "vcycle":
@@ -339,6 +340,7 @@ class Config:
                 self.refine_every = 1
             else:
                 raise ValueError(f"Unknown cycle_type: {self.cycle_type}")
+            self.refine_every = 4
         
         if self.pause_refine_after_reset is None:
             if self.cycle_type == "vcycle":
@@ -347,6 +349,7 @@ class Config:
                 self.pause_refine_after_reset = 1
             else:
                 raise ValueError(f"Unknown cycle_type: {self.cycle_type}")
+            self.pause_refine_after_reset = 4
 
     def adjust_steps(self, factor: float):
         # Note: eval_cycles and metric_interval_cycles are not scaled by factor
@@ -737,6 +740,70 @@ def perform_vcycle(
         losses=[],
         global_tic=global_tic,
     )
+
+
+
+
+def perform_hyphen_cycle(
+    current_step: int,
+    max_level: int,
+    coarsest_level: int,
+    smoothing_steps: int,
+    solving_steps: int,
+    total_steps: int,
+    runner: "Runner",
+    trainloader_iter,
+    schedulers: List,
+    cfg: Config,
+    pbar: Optional[tqdm.tqdm] = None,
+    vcycle_idx: int = 0,
+    global_tic: Optional[float] = None,
+) -> Tuple[int, List[float]]:
+    """
+    Perform a single V-cycle: max_level -> coarsest_level -> max_level.
+    
+    Wrapper function that calls the recursive V-cycle implementation.
+    
+    Args:
+        current_step: Current training step (will be updated)
+        max_level: Maximum LOD level (finest)
+        coarsest_level: Coarsest LOD level for this V-cycle
+        smoothing_steps: Number of smoothing steps per level
+        solving_steps: Number of solving steps at coarsest level
+        total_steps: Maximum number of steps
+        runner: Runner instance for training
+        trainloader_iter: Training data iterator
+        schedulers: List of learning rate schedulers
+        cfg: Config object
+        pbar: Optional progress bar
+        vcycle_idx: V-cycle index for display
+    
+    Returns:
+        current_step: Updated current step
+        losses: List of losses during this V-cycle
+    """
+    # Ensure coarsest_level is valid
+    coarsest_level = max(1, min(coarsest_level, max_level))  # Clamp to [1, max_level]
+    
+    # Call recursive V-cycle starting from max_level
+    return vcycle_recursive(
+        current_step=current_step,
+        level=max_level,
+        coarsest_level=max_level,
+        max_level=max_level,
+        smoothing_steps=smoothing_steps,
+        solving_steps=solving_steps,
+        total_steps=total_steps,
+        runner=runner,
+        trainloader_iter=trainloader_iter,
+        schedulers=schedulers,
+        cfg=cfg,
+        pbar=pbar,
+        vcycle_idx=vcycle_idx,
+        losses=[],
+        global_tic=global_tic,
+    )
+
 
 
 def perform_inv_fcycle(
@@ -1785,57 +1852,27 @@ class Runner:
                 if "max_level" in self.strategy_state:
                     self.strategy_state["max_level"] = strategy_max_level
             
-
-            # Get max_level for cycle based on cycle_type
-            # V-cycle uses actual max level in hierarchical structure
-            # inv-F cycle uses cfg.max_level for more regular training
-            if cfg.cycle_type == "vcycle":
-                # V-cycle: use actual max level from hierarchical structure
-                if len(self.multigrid_gaussians.levels) > 0:
-                    cycle_max_level = int(self.multigrid_gaussians.levels.max().item())
-                else:
-                    cycle_max_level = 1
-                
-                # V-cycle: finest -> 1 -> finest
-                cycle_coarsest_level = 1
-                current_step, losses = perform_vcycle(
-                    current_step=current_step,
-                    max_level=cycle_max_level,
-                    coarsest_level=cycle_coarsest_level,
-                    smoothing_steps=smoothing_steps,
-                    solving_steps=solving_steps,
-                    total_steps=max_steps,
-                    runner=self,
-                    trainloader_iter=trainloader_iter,
-                    schedulers=schedulers,
-                    cfg=cfg,
-                    pbar=pbar,
-                    vcycle_idx=vcycle_idx,
-                    global_tic=global_tic,
-                )
-            elif cfg.cycle_type == "inv_fcycle":
-                # inv-F cycle: use cfg.max_level for regular training
-                # Rasterization handles cases where actual max level < cfg.max_level
-                cycle_max_level = cfg.max_level if cfg.max_level is not None else 1
-                
-                # inv-F cycle: finest~1 -> finest~2 -> ... -> finest~finest
-                current_step, losses = perform_inv_fcycle(
-                    current_step=current_step,
-                    max_level=cycle_max_level,
-                    smoothing_steps=smoothing_steps,
-                    solving_steps=solving_steps,
-                    total_steps=max_steps,
-                    runner=self,
-                    trainloader_iter=trainloader_iter,
-                    schedulers=schedulers,
-                    cfg=cfg,
-                    pbar=pbar,
-                    cycle_idx=vcycle_idx,
-                    global_tic=global_tic,
-                )
-            else:
-                raise ValueError(f"Unknown cycle_type: {cfg.cycle_type}")
+            cycle_max_level = int(self.multigrid_gaussians.levels.max().item())
             
+            # V-cycle: finest -> 1 -> finest
+            cycle_coarsest_level = cycle_max_level
+            current_step, losses = perform_vcycle(
+                current_step=current_step,
+                max_level=cycle_max_level,
+                coarsest_level=cycle_coarsest_level,
+                smoothing_steps=smoothing_steps,
+                solving_steps=solving_steps,
+                total_steps=max_steps,
+                runner=self,
+                trainloader_iter=trainloader_iter,
+                schedulers=schedulers,
+                cfg=cfg,
+                pbar=pbar,
+                vcycle_idx=vcycle_idx,
+                global_tic=global_tic,
+            )
+
+
             # After cycle completion, perform densification if needed
             # This ensures hierarchical structure remains consistent during cycle
             if isinstance(self.cfg.strategy, MultigridStrategy):
