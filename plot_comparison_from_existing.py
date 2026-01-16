@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+# import simple_trainer_c2f
 
 # Configuration matching run_comparison.py
 DATASET_TYPE = "colmap"
@@ -102,14 +103,20 @@ def get_result_directories() -> Dict[str, Optional[str]]:
     result['simple'] = "/Bean/log/gwangjin/2025/gsplat/baseline/garden_type_colmap_factor_8"
     # result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_norm"
     # result['vcycle2'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_norm_2"
-    
+    result['simple_c2f'] = "/Bean/log/gwangjin/2025/gsplat/baseline_c2f/garden_type_colmap_factor_8/"
     # result['vc_v2'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_v2"
     # result['vc_v3'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_v3"
     # result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_vcycle/garden_type_colmap_factor_8_v1"
-    result['inv_fcycle_old'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_inv_fcycle/garden_type_colmap_factor_8_v7_randbkgd"
+    # result['inv_fcycle_old'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_inv_fcycle/garden_type_colmap_factor_8_v7_randbkgd"
     # result['inv_fcycle'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_inv_fcycle/garden_type_colmap_factor_8_v13_randbkgd"
-    result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_vcycle/garden_type_colmap_factor_8_v14_randbkgd"
-
+    # result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_vcycle/garden_type_colmap_factor_8_v14_randbkgd"
+    # result['c2f'] = "/Bean/log/gwangjin/2025/gsplat/coarse_to_fine/garden_type_colmap_factor_8_coarse_to_fine"
+    # result['c2f2'] = "/Bean/log/gwangjin/2025/gsplat/coarse_to_fine/garden_type_colmap_factor_8_coarse_to_fine_v3"
+    result['c2f_v3'] = "/Bean/log/gwangjin/2025/gsplat/coarse_to_fine_v3/garden_type_colmap_factor_8_coarse_to_fine_v2/"
+# 
+    # result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/vcycle_trainer_v12_vcycle/garden_type_colmap_factor_8_v12_v2/"
+    result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/vcycle_trainer_v14_vcycle/garden_type_colmap_factor_8_v14_v1/"
+    # result['inv_fcycle'] = "/Bean/log/gwangjin/2025/gsplat/vcycle_trainer_v13_inv_fcycle/garden_type_colmap_factor_8_v13_v1/"
     # if vcycle_dir:
     #     result['vcycle'] = vcycle_dir
     # if simple_dir:
@@ -139,6 +146,7 @@ def parse_stats_files(result_dir: Path) -> Dict[str, Dict[int, float]]:
         'ssim': {},
         'lpips': {},
         'num_GS': {},
+        'num_GS_finest': {},
         'ellipse_time': {},
     }
     
@@ -163,6 +171,8 @@ def parse_stats_files(result_dir: Path) -> Dict[str, Dict[int, float]]:
                     metrics['lpips'][step] = float(data['lpips'])
                 if 'num_GS' in data:
                     metrics['num_GS'][step] = float(data['num_GS'])
+                if 'num_GS_finest' in data:
+                    metrics['num_GS_finest'][step] = float(data['num_GS_finest'])
                 if 'ellipse_time' in data:
                     metrics['ellipse_time'][step] = float(data['ellipse_time'])
         except (json.JSONDecodeError, KeyError) as e:
@@ -190,12 +200,24 @@ def plot_metric_on_axis(
     if ylabel is None:
         ylabel = metric_name.upper()
     
-    # Filter to only methods that have data for this metric
-    methods_with_data = {
-        name: data.get(metric_name, {})
-        for name, data in all_data.items()
-        if metric_name in data and len(data[metric_name]) > 0
-    }
+    # Special handling for num_GS_finest: fallback to num_GS if not available
+    if metric_name == 'num_GS_finest':
+        methods_with_data = {}
+        for name, data in all_data.items():
+            # Try num_GS_finest first
+            if metric_name in data and len(data[metric_name]) > 0:
+                methods_with_data[name] = data[metric_name]
+            # Fallback to num_GS if num_GS_finest is not available
+            elif 'num_GS' in data and len(data['num_GS']) > 0:
+                methods_with_data[name] = data['num_GS']
+    else:
+        # Filter to only methods that have data for this metric
+        methods_with_data = {
+            name: data.get(metric_name, {})
+            for name, data in all_data.items()
+            if metric_name in data and len(data[metric_name]) > 0
+        }   
+        
 
     
     if not methods_with_data:
@@ -328,16 +350,17 @@ def main():
     
     # Create combined graph with all metrics
     print("Creating combined comparison graph...")
-    metrics_to_plot = ['psnr', 'ssim', 'lpips', 'num_GS', 'ellipse_time']
+    metrics_to_plot = ['psnr', 'ssim', 'lpips', 'num_GS', 'num_GS_finest', 'ellipse_time']
     ylabels = {
         'psnr': 'PSNR (dB)',
         'ssim': 'SSIM',
         'lpips': 'LPIPS',
-        'num_GS': 'Number of Gaussians',
+        'num_GS': 'Number of Gaussians (Total)',
+        'num_GS_finest': 'Number of Gaussians (Rendered)',
         'ellipse_time': 'Training Time (s)',
     }
     
-    # Create figure with 2x3 subplots (5 metrics, so 2 rows x 3 cols)
+    # Create figure with 2x3 subplots (6 metrics, so 2 rows x 3 cols)
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     axes = axes.flatten()
     

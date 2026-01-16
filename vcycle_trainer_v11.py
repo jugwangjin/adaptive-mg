@@ -1,9 +1,180 @@
 """
-vcycle_trainer_v6.py - Multigrid V-cycle Trainer with Residual Equation
+vcycle_trainer_v11.py - Multigrid V-cycle Trainer with Residual Equation
+
+TODO: Enhanced Restriction/Prolongation with Render Consistency
+================================================================
+
+Current State:
+--------------
+- Restriction/Prolongation currently only performs parameter passing:
+  * Restriction: Transfers fine-level parameter changes to coarse level via restrict_parameters()
+  * Prolongation: Implicitly handled through hierarchical parameter structure (get_splats)
+- Coarse-fine relation is indirectly defined through GT loss at each level
+
+Planned Enhancement:
+--------------------
+1. Add `restriction_steps` argument to Config (default: 0 for backward compatibility)
+2. Implement render-based restriction:
+   - For `restriction_steps` iterations:
+     * Render fine level and downsample: fine_render_downsampled = downsample(render_fine_level)
+     * Detach fine render to prevent gradient flow
+     * Optimize coarse level to match: loss = ||coarse_render - fine_render_downsampled.detach()||
+     * This directly enforces: coarse_render ≈ downsample(fine_render)
+3. Implement render-based prolongation:
+   - For `restriction_steps` iterations:
+     * Render coarse level: coarse_render
+     * Detach coarse render to prevent gradient flow
+     * Upsample and optimize fine level to match: loss = ||downsample(fine_render) - coarse_render.detach()||
+     * This directly enforces: downsample(fine_render) ≈ coarse_render
+
+Benefits:
+---------
+- Direct coarse-fine consistency: Ensures rendered outputs are consistent across levels
+- Better multigrid convergence: Coarse level directly represents downsampled fine level
+- Reduced GT dependency: Less reliance on GT for defining level relationships
+- More principled multigrid: Aligns with classical multigrid theory where coarse levels
+  should represent downsampled fine levels
+
+Analysis & Potential Improvements:
+-----------------------------------
+1. **Adaptive restriction_steps**:
+   - Start with fewer steps early in training, increase as model converges
+   - Could be level-dependent: more steps for coarser levels (larger scale differences)
+
+2. **Multi-scale consistency loss**:
+   - Instead of single downsampling, enforce consistency at multiple scales
+   - Loss = Σ_i w_i * ||downsample_i(fine_render) - coarse_render_i||
+   - Where coarse_render_i is rendered at different resolutions
+
+3. **Feature-space consistency**:
+   - Apply consistency in feature space (e.g., VGG features) rather than RGB
+   - Could be more robust to small geometric misalignments
+   - Loss = ||VGG_features(downsample(fine_render)) - VGG_features(coarse_render)||
+
+4. **Bidirectional consistency**:
+   - Enforce both directions simultaneously:
+     * coarse ≈ downsample(fine) AND upsample(coarse) ≈ fine
+   - More symmetric and potentially more stable
+
+5. **Progressive restriction**:
+   - Gradually increase the weight of restriction loss during V-cycle
+   - Early: more weight on GT loss, later: more weight on consistency loss
+
+6. **Hierarchical consistency**:
+   - Enforce consistency across all level pairs, not just adjacent levels
+   - For levels L1 < L2 < L3: ensure downsample(L3) ≈ L2 and downsample(L2) ≈ L1
+
+7. **Residual-based restriction**:
+   - Instead of matching renders directly, match residuals:
+     * coarse_residual ≈ downsample(fine_residual)
+   - Could be more stable as residuals are typically smaller
+
+8. **Gradient-aware restriction**:
+   - Weight restriction loss by gradient magnitude
+   - Focus consistency enforcement on regions with high gradients (important details)
+
+9. **Temporal consistency** (for video/sequential data):
+   - Enforce consistency across time steps as well as levels
+   - Could help with temporal coherence
+
+10. **Learned downsampling**:
+    - Instead of fixed bilinear downsampling, use a learnable downsampling network
+    - Could better adapt to the specific characteristics of Gaussian splatting
+
+Implementation Notes:
+---------------------
+- Restriction should be called after fine-level smoothing, before coarse-level solving
+- Prolongation should be called after coarse-level solving, before fine-level smoothing
+- Need to handle different resolutions: fine level at full resolution, coarse at downsampled
+- Consider memory: rendering at multiple levels simultaneously
+- Gradient flow: detach() is crucial to prevent unwanted gradient propagation
+
+TODO: Fixed Views Within V-Cycle
+=================================
+- **Goal**: Use the same set of views (cameras) for all smoothing/solving steps within a single V-cycle
+- **Rationale**: 
+  * Currently, each smoothing/solving step samples different random views from the dataset
+  * This introduces inconsistency: different views see different parts of the scene
+  * By fixing views within a cycle, we ensure all levels are optimized on the same scene regions
+  * This should improve multigrid convergence as coarse and fine levels are trained on consistent data
+  
+- **Implementation**:
+  * At the start of each V-cycle, sample a fixed set of views (e.g., 4-8 views)
+  * Use these same views for all smoothing steps (fine to coarse) and solving step (coarsest)
+  * Sample new views for the next V-cycle
+  
+- **Overfitting Concerns**:
+  * Using too few views (e.g., 1-2) could lead to overfitting to specific viewpoints
+  * However, with moderate view count (4-8), overfitting should be mitigated:
+    - Each view provides different scene coverage
+    - Multiple views together provide sufficient scene diversity
+    - V-cycle completes quickly (typically < 100 steps), limiting overfitting risk
+    - New views are sampled each cycle, providing long-term diversity
+  
+- **Benefits**:
+  * Consistent optimization target across all levels in a cycle
+  * Better coarse-fine alignment: coarse level learns to represent the same scene regions as fine level
+  * More stable multigrid convergence
+  * Potentially faster convergence due to consistent gradient signals
+  
+- **Trade-offs**:
+  * Slightly less view diversity within a cycle (but compensated by cycle-to-cycle diversity)
+  * Need to balance view count: too few → overfitting risk, too many → less consistency benefit
+  
+- **Recommended Approach**:
+  * Start with 4-6 views per cycle (good balance between consistency and diversity)
+  * Monitor training: if overfitting observed, increase to 8-10 views
+  * Consider adaptive view count: fewer views early (when model is coarse), more views later (when details matter)
 
 VERSION HISTORY AND KEY DIFFERENCES:
 
-v6 (Current):
+v11 (Current):
+    - **Fixed Views Within V-Cycle** (IMPLEMENTED):
+      * Added `num_cycle_views: int = 6` parameter to Config
+      * At the start of each V-cycle, samples a fixed set of views (num_cycle_views)
+      * All smoothing/solving/restriction/prolongation steps within a cycle use the same views
+      * Ensures consistent optimization target across all levels in a cycle
+      * Better coarse-fine alignment: coarse level learns to represent same scene regions as fine level
+      * More stable multigrid convergence due to consistent gradient signals
+    
+    - **Unified Step Counts**:
+      * `smoothing_steps`, `solving_steps`, `restriction_steps` now determined by `num_cycle_views`
+      * Each view is processed once, so num_cycle_views views = num_cycle_views steps
+      * `restriction_steps` automatically set to `num_cycle_views` for consistency
+    
+    - **Render Caching and Reuse**:
+      * Restriction: Pre-renders fine level for all views and caches results
+      * Each restriction step reuses cached fine renders (detached) for efficiency
+      * Prolongation: Pre-renders coarse level for all views and caches results
+      * Each prolongation step reuses cached coarse renders (detached) for efficiency
+      * Significantly reduces redundant rendering operations
+    
+    - **Updated Dependencies**:
+      * Uses `multigrid_v10` strategy (hierarchy block cloning support)
+      * Uses `multigrid_gaussians_v4` (improved initialization)
+      * `init_level1_ratio: float = 0.9` (increased from 0.5 for better initial representation)
+    
+    - **Result Directory**: Updated to `multigrid_v11_{cycle_type}`
+
+v10:
+    - Added TODO for Fixed Views Within V-Cycle (not yet implemented)
+    - Uses `multigrid_v10` and `multigrid_gaussians_v4`
+    - `init_level1_ratio: float = 0.9`
+    - Result directory: `multigrid_v10_{cycle_type}`
+
+v9:
+    - Render-based restriction/prolongation implementation
+    - `restriction_steps` parameter for render-based consistency enforcement
+
+v8:
+    - Cycle-based visualization and evaluation intervals
+    - Gradient inheritance for color gradients
+    - Integrated `is_grad_high` flag (grad2d OR color_grad)
+
+v7:
+    - Various improvements to densification logic
+
+v6:
     - **Multigrid Residual Equation Implementation**: 
       * Core multigrid concept: solve residual equation at coarse level
       * residual_color = render_current - GT (computed in _train_step)
@@ -82,10 +253,10 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-from gsplat.strategy.multigrid_v8 import MultigridStrategy
+from gsplat.strategy.multigrid_v10 import MultigridStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
-from multigrid_gaussians_v2 import MultigridGaussians, quaternion_multiply
+from multigrid_gaussians_v4 import MultigridGaussians, quaternion_multiply
 
 opacity_grad_norms = []
 
@@ -137,7 +308,7 @@ class Config:
     eval_cycles: List[int] = field(default_factory=lambda: [])
     # Interval for metric measurement (every N cycles). -1 means disable metric measurement.
     # Evaluation is performed at the end of each cycle, not during cycle execution.
-    metric_interval_cycles: int = 3
+    metric_interval_cycles: int = 5
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [30_000])
     # Whether to save ply file (storage size can be large)
@@ -214,8 +385,9 @@ class Config:
     # If set, gaussians at max_level will only duplicate (not split) even if split conditions are met
     max_level: Optional[int] = 4
     # Ratio of Level 1 points to Level 2 points during hierarchical initialization
-    # Level 1 = init_level1_ratio * Level 2 (default: 0.25, i.e., 1/4)
-    init_level1_ratio: float = 0.05
+    # Level 1 = init_level1_ratio * Level 2 (default: 0.9, i.e., 90%)
+    # Increased from 0.5 to 0.9 to improve initial representation power
+    init_level1_ratio: float = 0.9
     # Parent sampling method: "uniform" or "fps" (farthest point sampling)
     parent_sampling_method: Literal["uniform", "fps"] = "fps"
     
@@ -223,9 +395,11 @@ class Config:
     cycle_type: Literal["vcycle", "inv_fcycle"] = "vcycle"
     
     # V-cycle parameters
-    smoothing_steps: int = 32  # Number of smoothing steps per level (fixed at 100 for V-cycle)
-    solving_steps: int = 32  # Number of solving steps at coarsest level (fixed at 100 for V-cycle)
-    steps_decaying_per_level: float = 0.5
+    # Fixed views within V-cycle: use same views for all smoothing/solving/restriction steps
+    num_cycle_views: int = 6  # Number of views to use per V-cycle (fixed views for consistency)
+    # Note: smoothing_steps, solving_steps, restriction_steps are now determined by num_cycle_views
+    # Each view is processed once, so num_cycle_views views = num_cycle_views steps
+    steps_decaying_per_level: float = 0.9
     restriction_dampling: float = 1
     
     # Strategy parameters (set based on cycle_type in __post_init__)
@@ -287,7 +461,7 @@ class Config:
     visualization_interval: int = 1  # 1 = every cycle, 0 = disabled
     # Visualization: save hierarchy visualization (level pointclouds and linesets) at the end of each cycle
     # If > 0, saves hierarchy visualization after each cycle completion
-    hierarchy_visualization_interval: int = 50  # 1 = every cycle, 0 = disabled
+    hierarchy_visualization_interval: int = 100  # 1 = every cycle, 0 = disabled
 
     def __post_init__(self):
         """Auto-generate result_dir if not provided and set strategy parameters based on cycle_type."""
@@ -321,20 +495,20 @@ class Config:
                 settings_parts.append(f"patch_{self.patch_size}")
             
             settings_str = "_".join(settings_parts)
-            self.result_dir = f"/Bean/log/gwangjin/2025/gsplat/multigrid_{self.cycle_type}/{dataset_name}_{settings_str}"
+            self.result_dir = f"/Bean/log/gwangjin/2025/gsplat/vcycle_trainer_v11_{self.cycle_type}/{dataset_name}_{settings_str}"
         
         # Set strategy parameters based on cycle_type if not explicitly provided
         if self.reset_every is None:
             if self.cycle_type == "vcycle":
-                self.reset_every = 30
+                self.reset_every = 60
             elif self.cycle_type == "inv_fcycle":
-                self.reset_every = 20
+                self.reset_every = 30
             else:
                 raise ValueError(f"Unknown cycle_type: {self.cycle_type}")
         
         if self.refine_every is None:
             if self.cycle_type == "vcycle":
-                self.refine_every = 1
+                self.refine_every = 2
             elif self.cycle_type == "inv_fcycle":
                 self.refine_every = 1
             else:
@@ -375,6 +549,108 @@ class Config:
             assert_never(strategy)
 
 
+def _prepare_render_data(data: Dict, device: str) -> Dict[str, Tensor]:
+    """Prepare data for rendering: ensure batch dimensions and extract RGB.
+    
+    Args:
+        data: Raw data dictionary from dataloader
+        device: Target device
+        
+    Returns:
+        Dictionary with prepared tensors: camtoworlds, Ks_original, pixels_gt, 
+        original_height, original_width, image_ids, masks
+    """
+    camtoworlds = data["camtoworld"].to(device)
+    Ks_original = data["K"].to(device)
+    image_data = data["image"].to(device) / 255.0
+    
+    # Ensure batch dimension exists
+    if camtoworlds.dim() == 2:
+        camtoworlds = camtoworlds.unsqueeze(0)
+    if Ks_original.dim() == 2:
+        Ks_original = Ks_original.unsqueeze(0)
+    if image_data.dim() == 3:
+        image_data = image_data.unsqueeze(0)
+    
+    # Extract RGB
+    if image_data.shape[-1] == 4:
+        pixels_gt = image_data[..., :3]
+    else:
+        pixels_gt = image_data
+    
+    original_height, original_width = pixels_gt.shape[1:3]
+    
+    # Prepare image_ids and masks
+    if isinstance(data["image_id"], torch.Tensor):
+        image_ids = data["image_id"].to(device)
+    else:
+        image_ids = torch.tensor(data["image_id"], device=device)
+    masks = data["mask"].to(device) if "mask" in data else None
+    if masks is not None and masks.dim() == 2:
+        masks = masks.unsqueeze(0)
+    
+    return {
+        "camtoworlds": camtoworlds,
+        "Ks_original": Ks_original,
+        "pixels_gt": pixels_gt,
+        "original_height": original_height,
+        "original_width": original_width,
+        "image_ids": image_ids,
+        "masks": masks,
+        "data": data,  # Keep original data for reference
+    }
+
+
+def _compute_render_loss(render1: Tensor, render2: Tensor, cfg: Config) -> Tensor:
+    """Compute combined L1 + SSIM loss between two renders.
+    
+    Args:
+        render1: First render [1, H, W, 3]
+        render2: Second render [1, H, W, 3]
+        cfg: Config with ssim_lambda
+        
+    Returns:
+        Combined loss scalar
+    """
+    l1_loss = F.l1_loss(render1, render2)
+    ssim_loss = 1.0 - fused_ssim(
+        render1.permute(0, 3, 1, 2),
+        render2.permute(0, 3, 1, 2),
+        padding="valid"
+    )
+    return l1_loss * (1.0 - cfg.ssim_lambda) + ssim_loss * cfg.ssim_lambda
+
+
+def _optimize_and_update_step(
+    optimizers: Dict,
+    schedulers: List,
+    current_step: int,
+    total_steps: int,
+    pbar: Optional[tqdm.tqdm],
+    desc: str,
+    loss_value: float,
+) -> int:
+    """Optimize parameters, update schedulers, and progress bar.
+    
+    Returns:
+        Updated current_step
+    """
+    for optimizer in optimizers.values():
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+    
+    if current_step < total_steps:
+        for scheduler in schedulers:
+            scheduler.step()
+        current_step += 1
+    
+    if pbar is not None:
+        pbar.update(1)
+        pbar.set_description(desc)
+    
+    return current_step
+
+
 def vcycle_recursive(
     current_step: int,
     level: int,
@@ -391,6 +667,7 @@ def vcycle_recursive(
     vcycle_idx: int = 0,
     losses: Optional[List[float]] = None,
     global_tic: Optional[float] = None,
+    cycle_views: Optional[List[Dict]] = None,
 ) -> Tuple[int, List[float]]:
     """
     Recursive V-cycle: max_level -> coarsest_level -> max_level.
@@ -406,16 +683,17 @@ def vcycle_recursive(
         level: Current level in the V-cycle
         coarsest_level: Coarsest LOD level for this V-cycle
         max_level: Maximum LOD level (finest)
-        smoothing_steps: Number of smoothing steps per level
-        solving_steps: Number of solving steps at coarsest level
+        smoothing_steps: Number of smoothing steps per level (now = num_cycle_views)
+        solving_steps: Number of solving steps at coarsest level (now = num_cycle_views)
         total_steps: Maximum number of steps
         runner: Runner instance for training
-        trainloader_iter: Training data iterator
+        trainloader_iter: Training data iterator (not used if cycle_views is provided)
         schedulers: List of learning rate schedulers
         cfg: Config object
         pbar: Optional progress bar
         vcycle_idx: V-cycle index for display
         losses: List of losses (accumulated across recursion)
+        cycle_views: Fixed list of views to use for this V-cycle (same views for all steps)
     
     Returns:
         current_step: Updated current step
@@ -424,18 +702,27 @@ def vcycle_recursive(
     if losses is None:
         losses = []
     
+    # Use fixed cycle_views if provided, otherwise fall back to trainloader_iter
+    use_fixed_views = cycle_views is not None and len(cycle_views) > 0
+    if use_fixed_views:
+        view_idx = 0  # Index into cycle_views
+    
     # Base case: coarsest level - perform solving
     if level == coarsest_level:
         # ========== Coarsest Level Solving ==========
         current_solving_steps = int(solving_steps * (cfg.steps_decaying_per_level ** (max_level - level)))
         current_solving_steps = max(1, current_solving_steps)
         for solving_step in range(current_solving_steps):
-            # Continue V-cycle even if max_steps is reached (complete the cycle)
-            try:
-                data = next(trainloader_iter)
-            except StopIteration:
-                trainloader_iter = iter(runner.trainloader)
-                data = next(trainloader_iter)
+            # Use fixed views if available, otherwise sample from trainloader
+            if use_fixed_views:
+                data = cycle_views[view_idx % len(cycle_views)]
+                view_idx = (view_idx + 1) % len(cycle_views)
+            else:
+                try:
+                    data = next(trainloader_iter)
+                except StopIteration:
+                    trainloader_iter = iter(runner.trainloader)
+                    data = next(trainloader_iter)
             
             log_step = min(current_step, total_steps - 1) if total_steps > 0 else current_step
             
@@ -497,6 +784,8 @@ def vcycle_recursive(
             pbar=pbar,
             vcycle_idx=vcycle_idx,
             losses=losses,
+            global_tic=global_tic,
+            cycle_views=cycle_views,
         )
         # Continue with upward pass (will be handled after restriction block)
         return current_step, losses
@@ -515,14 +804,18 @@ def vcycle_recursive(
     current_smoothing_steps = int(smoothing_steps * (cfg.steps_decaying_per_level ** (max_level - level)))
     current_smoothing_steps = max(1, current_smoothing_steps)
     # Smoothing steps at current level
-    # Residual calculation is now done inside _train_step (view changes every step)
+    # Use fixed views for consistency across all steps
     for smoothing_step in range(current_smoothing_steps):
-        # Continue V-cycle even if max_steps is reached (complete the cycle)
-        try:
-            data = next(trainloader_iter)
-        except StopIteration:
-            trainloader_iter = iter(runner.trainloader)
-            data = next(trainloader_iter)
+        # Use fixed views if available, otherwise sample from trainloader
+        if use_fixed_views:
+            data = cycle_views[view_idx % len(cycle_views)]
+            view_idx = (view_idx + 1) % len(cycle_views)
+        else:
+            try:
+                data = next(trainloader_iter)
+            except StopIteration:
+                trainloader_iter = iter(runner.trainloader)
+                data = next(trainloader_iter)
         
         log_step = min(current_step, total_steps - 1) if total_steps > 0 else current_step
         
@@ -612,9 +905,163 @@ def vcycle_recursive(
         runner.multigrid_gaussians.invalidate_splats_cache()
         torch.cuda.empty_cache()
     
+    # ========== Render-based Restriction ==========
+    # If restriction_steps > 0, perform render-based restriction:
+    # Fine level render -> downsample -> optimize coarse level to match
+    # Pre-render fine level for all views to reuse (same views used for all restriction steps)
+    fine_renders_cache = {}  # Cache for fine level renders: {view_idx: fine_render_downsampled}
+    if cfg.restriction_steps > 0 and level > coarsest_level:
+        coarse_level = level - 1
+        current_restriction_steps = int(cfg.restriction_steps * (cfg.steps_decaying_per_level ** (max_level - level)))
+        current_restriction_steps = max(1, current_restriction_steps)
+        
+        # Pre-render fine level for all views (reuse across restriction steps)
+        log_step = min(current_step, total_steps - 1) if total_steps > 0 else current_step
+        image_multigrid_max_level = cfg.max_level if cfg.max_level is not None else 1
+        
+        # Calculate coarse resolution once: sqrt(2)^(max_level - coarse_level) = 2^((max_level - coarse_level)/2)
+        downsample_factor = 2 ** ((image_multigrid_max_level - coarse_level) / 2.0)
+        downsample_factor = max(1, int(downsample_factor))
+        
+        for view_idx_pre in range(len(cycle_views) if use_fixed_views else current_restriction_steps):
+            if use_fixed_views:
+                data_pre = cycle_views[view_idx_pre]
+            else:
+                try:
+                    data_pre = next(trainloader_iter)
+                except StopIteration:
+                    trainloader_iter = iter(runner.trainloader)
+                    data_pre = next(trainloader_iter)
+            
+            # Prepare data for rendering
+            render_data_pre = _prepare_render_data(data_pre, runner.device)
+            coarse_height_pre = max(1, int(render_data_pre["original_height"] // downsample_factor))
+            coarse_width_pre = max(1, int(render_data_pre["original_width"] // downsample_factor))
+            
+            # Render fine level and downsample (detached, cached for reuse)
+            with torch.no_grad():
+                fine_colors_pre, _, _, _ = runner.render_at_level(
+                    target_level=level,
+                    pixels_gt=render_data_pre["pixels_gt"],
+                    original_height=render_data_pre["original_height"],
+                    original_width=render_data_pre["original_width"],
+                    camtoworlds=render_data_pre["camtoworlds"],
+                    Ks_original=render_data_pre["Ks_original"],
+                    image_multigrid_max_level=image_multigrid_max_level,
+                    sh_degree=min(log_step // cfg.sh_degree_interval, cfg.sh_degree),
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    image_ids=render_data_pre["image_ids"],
+                    masks=render_data_pre["masks"],
+                    render_mode="RGB",
+                )  # [1, H_fine, W_fine, 3]
+                
+                # Downsample fine render to coarse resolution
+                fine_colors_bchw_pre = fine_colors_pre.permute(0, 3, 1, 2)  # [1, 3, H_fine, W_fine]
+                fine_render_downsampled_bchw_pre = F.interpolate(
+                    fine_colors_bchw_pre,
+                    size=(coarse_height_pre, coarse_width_pre),
+                    mode='bilinear',
+                    align_corners=False,
+                )
+                fine_render_downsampled_pre = fine_render_downsampled_bchw_pre.permute(0, 2, 3, 1)  # [1, H_coarse, W_coarse, 3]
+                fine_render_downsampled_pre = fine_render_downsampled_pre.detach()  # Detach to prevent gradient flow
+                
+                # Cache for reuse
+                fine_renders_cache[view_idx_pre] = {
+                    "fine_render_downsampled": fine_render_downsampled_pre,
+                    "render_data": render_data_pre,
+                    "coarse_height": coarse_height_pre,
+                    "coarse_width": coarse_width_pre,
+                }
+        
+        # Now perform restriction steps using cached fine renders
+        for restriction_step in range(current_restriction_steps):
+            # Use fixed views if available, otherwise sample from trainloader
+            if use_fixed_views:
+                view_idx_restrict = view_idx % len(cycle_views)
+                cached = fine_renders_cache[view_idx_restrict]
+                fine_render_downsampled = cached["fine_render_downsampled"]
+                render_data = cached["render_data"]
+                view_idx = (view_idx + 1) % len(cycle_views)
+            else:
+                try:
+                    data = next(trainloader_iter)
+                except StopIteration:
+                    trainloader_iter = iter(runner.trainloader)
+                    data = next(trainloader_iter)
+                
+                render_data = _prepare_render_data(data, runner.device)
+                coarse_height = max(1, int(render_data["original_height"] // downsample_factor))
+                coarse_width = max(1, int(render_data["original_width"] // downsample_factor))
+                
+                # Render fine level and downsample
+                with torch.no_grad():
+                    fine_colors, _, _, _ = runner.render_at_level(
+                        target_level=level,
+                        pixels_gt=render_data["pixels_gt"],
+                        original_height=render_data["original_height"],
+                        original_width=render_data["original_width"],
+                        camtoworlds=render_data["camtoworlds"],
+                        Ks_original=render_data["Ks_original"],
+                        image_multigrid_max_level=image_multigrid_max_level,
+                        sh_degree=min(log_step // cfg.sh_degree_interval, cfg.sh_degree),
+                        near_plane=cfg.near_plane,
+                        far_plane=cfg.far_plane,
+                        image_ids=render_data["image_ids"],
+                        masks=render_data["masks"],
+                        render_mode="RGB",
+                    )  # [1, H_fine, W_fine, 3]
+                    
+                    # Downsample fine render to coarse resolution
+                    fine_colors_bchw = fine_colors.permute(0, 3, 1, 2)  # [1, 3, H_fine, W_fine]
+                    fine_render_downsampled_bchw = F.interpolate(
+                        fine_colors_bchw,
+                        size=(coarse_height, coarse_width),
+                        mode='bilinear',
+                        align_corners=False,
+                    )
+                    fine_render_downsampled = fine_render_downsampled_bchw.permute(0, 2, 3, 1)  # [1, H_coarse, W_coarse, 3]
+                    fine_render_downsampled = fine_render_downsampled.detach()  # Detach to prevent gradient flow
+            
+            # Render coarse level
+            coarse_colors, _, _, info = runner.render_at_level(
+                target_level=coarse_level,
+                pixels_gt=render_data["pixels_gt"],
+                original_height=render_data["original_height"],
+                original_width=render_data["original_width"],
+                camtoworlds=render_data["camtoworlds"],
+                Ks_original=render_data["Ks_original"],
+                image_multigrid_max_level=image_multigrid_max_level,
+                sh_degree=min(log_step // cfg.sh_degree_interval, cfg.sh_degree),
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                image_ids=render_data["image_ids"],
+                masks=render_data["masks"],
+                render_mode="RGB",
+            )  # [1, H_coarse, W_coarse, 3]
+            
+            # Compute restriction loss and optimize
+            restriction_loss = _compute_render_loss(coarse_colors, fine_render_downsampled, cfg)
+            restriction_loss.backward()
+            
+            avg_loss = np.mean(losses) if losses else 0.0
+            desc = f"V-cycle {vcycle_idx}| Restrict L{level}->L{coarse_level}| loss={avg_loss:.3f}| step={current_step}/{total_steps}"
+            current_step = _optimize_and_update_step(
+                runner.optimizers, schedulers, current_step, total_steps, pbar, desc, restriction_loss.item()
+            )
+            losses.append(restriction_loss.item())
+            
+            # Free intermediate tensors (but keep cached fine renders)
+            if not use_fixed_views:
+                del fine_colors, fine_render_downsampled
+            del coarse_colors
+            torch.cuda.empty_cache()
+    
     # ========== Recurse to coarser level ==========
     # Note: visible_mask, parent_indices, has_parent, valid_indices are still needed for upward pass
     # but we can free them after recursive call if not needed
+    # Pass cycle_views to recursive call to maintain fixed views
     current_step, losses = vcycle_recursive(
         current_step=current_step,
         level=level - 1,
@@ -631,6 +1078,7 @@ def vcycle_recursive(
         vcycle_idx=vcycle_idx,
         losses=losses,
         global_tic=global_tic,
+        cycle_views=cycle_views,
     )
     
     # Free variables that are no longer needed after recursive call
@@ -641,17 +1089,172 @@ def vcycle_recursive(
     # Coarse level changes are automatically reflected in fine level through get_splats
     # which uses parent's current residual values when computing hierarchical structure
     
+    # ========== Render-based Prolongation ==========
+    # If restriction_steps > 0, perform render-based prolongation:
+    # Coarse level render -> upsample -> optimize fine level to match
+    # Reuse fine renders from restriction cache if available (same views)
+    coarse_renders_cache = {}  # Cache for coarse level renders: {view_idx: coarse_render}
+    if cfg.restriction_steps > 0 and level > coarsest_level:
+        coarse_level = level - 1
+        current_restriction_steps = int(cfg.restriction_steps * (cfg.steps_decaying_per_level ** (max_level - level)))
+        current_restriction_steps = max(1, current_restriction_steps)
+        
+        log_step = min(current_step, total_steps - 1) if total_steps > 0 else current_step
+        image_multigrid_max_level = cfg.max_level if cfg.max_level is not None else 1
+        
+        # Pre-render coarse level for all views (reuse across prolongation steps)
+        # Reuse data from restriction cache if available
+        for view_idx_pre in range(len(cycle_views) if use_fixed_views else current_restriction_steps):
+            if use_fixed_views:
+                data_pre = cycle_views[view_idx_pre]
+                # Reuse data from restriction cache if available
+                if view_idx_pre in fine_renders_cache:
+                    render_data_pre = fine_renders_cache[view_idx_pre]["render_data"]
+                else:
+                    render_data_pre = _prepare_render_data(data_pre, runner.device)
+            else:
+                try:
+                    data_pre = next(trainloader_iter)
+                except StopIteration:
+                    trainloader_iter = iter(runner.trainloader)
+                    data_pre = next(trainloader_iter)
+                render_data_pre = _prepare_render_data(data_pre, runner.device)
+            
+            # Calculate coarse resolution
+            downsample_factor = 2 ** ((image_multigrid_max_level - coarse_level) / 2.0)
+            downsample_factor = max(1, int(downsample_factor))
+            coarse_height_pre = max(1, int(render_data_pre["original_height"] // downsample_factor))
+            coarse_width_pre = max(1, int(render_data_pre["original_width"] // downsample_factor))
+            
+            # Render coarse level and detach (cached for reuse)
+            with torch.no_grad():
+                coarse_colors_pre, _, _, _ = runner.render_at_level(
+                    target_level=coarse_level,
+                    pixels_gt=render_data_pre["pixels_gt"],
+                    original_height=render_data_pre["original_height"],
+                    original_width=render_data_pre["original_width"],
+                    camtoworlds=render_data_pre["camtoworlds"],
+                    Ks_original=render_data_pre["Ks_original"],
+                    image_multigrid_max_level=image_multigrid_max_level,
+                    sh_degree=min(log_step // cfg.sh_degree_interval, cfg.sh_degree),
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    image_ids=render_data_pre["image_ids"],
+                    masks=render_data_pre["masks"],
+                    render_mode="RGB",
+                )  # [1, H_coarse, W_coarse, 3]
+                coarse_colors_pre = coarse_colors_pre.detach()  # Detach to prevent gradient flow
+                
+                # Cache for reuse
+                coarse_renders_cache[view_idx_pre] = {
+                    "coarse_render": coarse_colors_pre,
+                    "render_data": render_data_pre,
+                    "coarse_height": coarse_height_pre,
+                    "coarse_width": coarse_width_pre,
+                }
+        
+        # Now perform prolongation steps using cached coarse renders
+        for prolongation_step in range(current_restriction_steps):
+            # Use fixed views if available, otherwise sample from trainloader
+            if use_fixed_views:
+                view_idx_prolong = view_idx % len(cycle_views)
+                cached_coarse = coarse_renders_cache[view_idx_prolong]
+                coarse_colors = cached_coarse["coarse_render"]
+                render_data = cached_coarse["render_data"]
+                view_idx = (view_idx + 1) % len(cycle_views)
+            else:
+                try:
+                    data = next(trainloader_iter)
+                except StopIteration:
+                    trainloader_iter = iter(runner.trainloader)
+                    data = next(trainloader_iter)
+                
+                render_data = _prepare_render_data(data, runner.device)
+                
+                # Render coarse level and detach
+                with torch.no_grad():
+                    coarse_colors, _, _, _ = runner.render_at_level(
+                        target_level=coarse_level,
+                        pixels_gt=render_data["pixels_gt"],
+                        original_height=render_data["original_height"],
+                        original_width=render_data["original_width"],
+                        camtoworlds=render_data["camtoworlds"],
+                        Ks_original=render_data["Ks_original"],
+                        image_multigrid_max_level=image_multigrid_max_level,
+                        sh_degree=min(log_step // cfg.sh_degree_interval, cfg.sh_degree),
+                        near_plane=cfg.near_plane,
+                        far_plane=cfg.far_plane,
+                        image_ids=render_data["image_ids"],
+                        masks=render_data["masks"],
+                        render_mode="RGB",
+                    )  # [1, H_coarse, W_coarse, 3]
+                    coarse_colors = coarse_colors.detach()  # Detach to prevent gradient flow
+            
+            # Render fine level
+            fine_colors, _, _, info = runner.render_at_level(
+                target_level=level,
+                pixels_gt=render_data["pixels_gt"],
+                original_height=render_data["original_height"],
+                original_width=render_data["original_width"],
+                camtoworlds=render_data["camtoworlds"],
+                Ks_original=render_data["Ks_original"],
+                image_multigrid_max_level=image_multigrid_max_level,
+                sh_degree=min(log_step // cfg.sh_degree_interval, cfg.sh_degree),
+                near_plane=cfg.near_plane,
+                far_plane=cfg.far_plane,
+                image_ids=render_data["image_ids"],
+                masks=render_data["masks"],
+                render_mode="RGB",
+            )  # [1, H_fine, W_fine, 3]
+            
+            # Downsample fine render to coarse resolution for comparison
+            downsample_factor = 2 ** ((image_multigrid_max_level - coarse_level) / 2.0)
+            downsample_factor = max(1, int(downsample_factor))
+            coarse_height = cached_coarse["coarse_height"] if use_fixed_views else max(1, int(render_data["original_height"] // downsample_factor))
+            coarse_width = cached_coarse["coarse_width"] if use_fixed_views else max(1, int(render_data["original_width"] // downsample_factor))
+            
+            fine_colors_bchw = fine_colors.permute(0, 3, 1, 2)  # [1, 3, H_fine, W_fine]
+            fine_render_downsampled_bchw = F.interpolate(
+                fine_colors_bchw,
+                size=(coarse_height, coarse_width),
+                mode='bilinear',
+                align_corners=False,
+            )
+            fine_render_downsampled = fine_render_downsampled_bchw.permute(0, 2, 3, 1)  # [1, H_coarse, W_coarse, 3]
+            
+            # Compute prolongation loss and optimize
+            prolongation_loss = _compute_render_loss(fine_render_downsampled, coarse_colors, cfg)
+            prolongation_loss.backward()
+            
+            avg_loss = np.mean(losses) if losses else 0.0
+            desc = f"V-cycle {vcycle_idx}| Prolong L{coarse_level}->L{level}| loss={avg_loss:.3f}| step={current_step}/{total_steps}"
+            current_step = _optimize_and_update_step(
+                runner.optimizers, schedulers, current_step, total_steps, pbar, desc, prolongation_loss.item()
+            )
+            losses.append(prolongation_loss.item())
+            
+            # Free intermediate tensors (but keep cached renders)
+            if not use_fixed_views:
+                del coarse_colors
+            del fine_colors, fine_render_downsampled
+            torch.cuda.empty_cache()
+    
     # ========== Upward: Smoothing at current level ==========
     # Smoothing steps at current level (after returning from coarser level)
+    # Use fixed views for consistency
     current_smoothing_steps = int(smoothing_steps * (cfg.steps_decaying_per_level ** (max_level - level)))
     current_smoothing_steps = max(1, current_smoothing_steps)
     for smoothing_step in range(current_smoothing_steps):
-        # Continue V-cycle even if max_steps is reached (complete the cycle)
-        try:
-            data = next(trainloader_iter)
-        except StopIteration:
-            trainloader_iter = iter(runner.trainloader)
-            data = next(trainloader_iter)
+        # Use fixed views if available, otherwise sample from trainloader
+        if use_fixed_views:
+            data = cycle_views[view_idx % len(cycle_views)]
+            view_idx = (view_idx + 1) % len(cycle_views)
+        else:
+            try:
+                data = next(trainloader_iter)
+            except StopIteration:
+                trainloader_iter = iter(runner.trainloader)
+                data = next(trainloader_iter)
         
         log_step = min(current_step, total_steps - 1) if total_steps > 0 else current_step
         
@@ -697,13 +1300,14 @@ def perform_vcycle(
     Perform a single V-cycle: max_level -> coarsest_level -> max_level.
     
     Wrapper function that calls the recursive V-cycle implementation.
+    Samples fixed views at the start of the cycle for consistency.
     
     Args:
         current_step: Current training step (will be updated)
         max_level: Maximum LOD level (finest)
         coarsest_level: Coarsest LOD level for this V-cycle
-        smoothing_steps: Number of smoothing steps per level
-        solving_steps: Number of solving steps at coarsest level
+        smoothing_steps: Number of smoothing steps per level (now = num_cycle_views)
+        solving_steps: Number of solving steps at coarsest level (now = num_cycle_views)
         total_steps: Maximum number of steps
         runner: Runner instance for training
         trainloader_iter: Training data iterator
@@ -719,7 +1323,19 @@ def perform_vcycle(
     # Ensure coarsest_level is valid
     coarsest_level = max(1, min(coarsest_level, max_level))  # Clamp to [1, max_level]
     
-    # Call recursive V-cycle starting from max_level
+    # Sample fixed views for this V-cycle
+    # Use num_cycle_views views, sampled from trainloader
+    cycle_views = []
+    temp_iter = iter(runner.trainloader)
+    for _ in range(cfg.num_cycle_views):
+        try:
+            data = next(temp_iter)
+        except StopIteration:
+            temp_iter = iter(runner.trainloader)
+            data = next(temp_iter)
+        cycle_views.append(data)
+    
+    # Call recursive V-cycle starting from max_level with fixed views
     return vcycle_recursive(
         current_step=current_step,
         level=max_level,
@@ -736,6 +1352,7 @@ def perform_vcycle(
         vcycle_idx=vcycle_idx,
         losses=[],
         global_tic=global_tic,
+        cycle_views=cycle_views,
     )
 
 
@@ -1156,16 +1773,16 @@ class Runner:
         cfg = self.cfg
         device = self.device
         
-        # Calculate downsample factor: 2^(max_level - target_level)
+        # Calculate downsample factor: sqrt(2)^(max_level - target_level) = 2^((max_level - target_level)/2)
         if force_original_resolution:
             downsample_factor = 1
         else:
-            downsample_factor = 2 ** (image_multigrid_max_level - target_level)
-            downsample_factor = max(1, downsample_factor)  # Ensure at least 1 (no upsampling)
+            downsample_factor = 2 ** ((image_multigrid_max_level - target_level) / 2.0)
+            downsample_factor = max(1, int(downsample_factor))  # Ensure at least 1 (no upsampling) and convert to int
         
         # Calculate target resolution
-        height = max(1, original_height // downsample_factor)
-        width = max(1, original_width // downsample_factor)
+        height = max(1, int(original_height // downsample_factor))
+        width = max(1, int(original_width // downsample_factor))
         
         # Downsample GT image
         if downsample_factor > 1:
@@ -1299,8 +1916,9 @@ class Runner:
             masks = masks.unsqueeze(0)  # [H, W] -> [1, H, W]
         
         # Calculate downsample factor for current target_level (for points downsampling)
-        downsample_factor = 2 ** (image_multigrid_max_level - target_level)
-        downsample_factor = max(1, downsample_factor)
+        # sqrt(2)^(max_level - target_level) = 2^((max_level - target_level)/2)
+        downsample_factor = 2 ** ((image_multigrid_max_level - target_level) / 2.0)
+        downsample_factor = max(1, int(downsample_factor))
         
         if cfg.depth_loss:
             points = data["points"].to(device)  # [1, M, 2]
@@ -1370,14 +1988,14 @@ class Runner:
                 residual_target_finer = finer_pixels_downsampled - finer_colors  # [1, H_finer, W_finer, 3]
                 
                 # Downsample residual from finer level resolution to current target level resolution
-                # target_level + 1 has 2x higher resolution than target_level
-                finer_downsample = 2 ** (image_multigrid_max_level - (target_level + 1))
+                # target_level + 1 has sqrt(2)x higher resolution than target_level
+                finer_downsample = 2 ** ((image_multigrid_max_level - (target_level + 1)) / 2.0)
                 current_downsample = downsample_factor
                 
                 if finer_downsample < current_downsample:
                     # Finer level has higher resolution, need to downsample residual
-                    current_height = max(1, original_height // current_downsample)
-                    current_width = max(1, original_width // current_downsample)
+                    current_height = max(1, int(original_height // current_downsample))
+                    current_width = max(1, int(original_width // current_downsample))
                     
                     residual_target_downsampled_bchw = residual_target_finer.permute(0, 3, 1, 2)  # [1, 3, H_finer, W_finer]
                     residual_target_downsampled_bchw = F.interpolate(
@@ -1754,9 +2372,12 @@ class Runner:
 
         print(len(trainloader))
 
-        # V-cycle training: use config values for smoothing_steps and solving_steps
-        smoothing_steps = cfg.smoothing_steps
-        solving_steps = cfg.solving_steps
+        # V-cycle training: use num_cycle_views for smoothing_steps and solving_steps
+        # Fixed views within V-cycle: same views used for all smoothing/solving/restriction steps
+        smoothing_steps = cfg.num_cycle_views
+        solving_steps = cfg.num_cycle_views
+        # restriction_steps also uses num_cycle_views for consistency
+        cfg.restriction_steps = cfg.num_cycle_views
         
         # Training loop with V-cycles
         global_tic = time.time()
@@ -2439,15 +3060,15 @@ class Runner:
             
             # Render at each level and collect images
             for render_level in levels_to_render:
-                # Calculate downsample factor: 2^(max_level - render_level)
-                downsample_factor = 2 ** (image_multigrid_max_level - render_level)
-                downsample_factor = max(1, downsample_factor)  # Ensure at least 1 (no upsampling)
+                # Calculate downsample factor: sqrt(2)^(max_level - render_level) = 2^((max_level - render_level)/2)
+                downsample_factor = 2 ** ((image_multigrid_max_level - render_level) / 2.0)
+                downsample_factor = max(1, int(downsample_factor))  # Ensure at least 1 (no upsampling) and convert to int
                 
                 # Downsample for rendering
                 if downsample_factor > 1:
                     # Calculate new dimensions
-                    render_height = max(1, height // downsample_factor)
-                    render_width = max(1, width // downsample_factor)
+                    render_height = max(1, int(height // downsample_factor))
+                    render_width = max(1, int(width // downsample_factor))
                     
                     # Downsample Ks (camera intrinsics)
                     # Ks format: [fx, 0, cx; 0, fy, cy; 0, 0, 1]
@@ -2699,7 +3320,15 @@ class Runner:
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
             depths = renders[..., 3:4]  # [1, H, W, 1]
-            depths = (depths - depths.min()) / (depths.max() - depths.min())
+            # Normalize depths safely (handle empty or constant depth values)
+            depth_min = depths.min()
+            depth_max = depths.max()
+            depth_range = depth_max - depth_min
+            if depth_range > 1e-8:  # Avoid division by zero
+                depths = (depths - depth_min) / depth_range
+            else:
+                # If all depths are the same or empty, set to zero
+                depths = torch.zeros_like(depths)
             canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
 
             # write images

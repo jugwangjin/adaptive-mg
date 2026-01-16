@@ -1,4 +1,4 @@
-from typing import Callable, Dict, List, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -60,10 +60,15 @@ def duplicate(
     levels: Tensor,
     parent_indices: Tensor,
     level_indices: Dict[int, List[int]],
+    mask_root: Optional[Tensor] = None,
+    max_level: Optional[int] = None,
 ):
     """Inplace duplicate the Gaussian with the given mask (multigrid version, default.py style).
     
     Same as default.py duplicate but with hierarchical structure updates.
+    
+    If mask_root is provided, creates linear tree structure (1 child per level) 
+    from level 2 to max_level for root nodes in mask_root.
 
     Args:
         params: A dictionary of parameters.
@@ -73,6 +78,9 @@ def duplicate(
         levels: Tensor [N,] with level for each gaussian.
         parent_indices: Tensor [N,] with parent index for each gaussian (-1 means no parent).
         level_indices: Dict mapping level -> list of gaussian indices at that level.
+        mask_root: Optional boolean mask indicating which gaussians in mask are roots.
+                  If provided along with max_level, creates linear tree children for these roots.
+        max_level: Maximum level in the hierarchy. Required if mask_root is provided.
     """
     device = mask.device
     sel = torch.where(mask)[0]
@@ -138,6 +146,36 @@ def duplicate(
         multigrid_gaussians.level_indices = level_indices_new
         # Invalidate cache after densification
         multigrid_gaussians.invalidate_splats_cache()
+    
+    # If mask_root is provided, create linear tree structure for root nodes
+    if mask_root is not None and max_level is not None:
+        # Update structure after duplicate
+        levels = state["levels"]
+        parent_indices = state["parent_indices"]
+        level_indices = state["level_indices"]
+        N_old = len(levels)
+        
+        # Get duplicated gaussians that are roots (they are at the end)
+        # mask_root indicates which gaussians in mask were roots
+        # After duplicate, these are at indices [N_old - len(sel_root), N_old)
+        # where sel_root are the root gaussians from the original mask
+        sel_root = torch.where(mask_root)[0]  # Original indices of root gaussians in mask
+        if len(sel_root) > 0:
+            # After duplicate, root gaussians are at the end: [N_old - len(sel_root), N_old)
+            duplicated_start_idx = N_old - len(sel_root)
+            duplicated_indices = torch.arange(duplicated_start_idx, N_old, device=mask.device)
+            
+            # Create linear tree structure for duplicated roots
+            _create_linear_tree_children(
+                params=params,
+                optimizers=optimizers,
+                state=state,
+                root_indices=duplicated_indices,
+                levels=levels,
+                parent_indices=parent_indices,
+                level_indices=level_indices,
+                max_level=max_level,
+            )
 
 
 @torch.no_grad()
@@ -150,11 +188,16 @@ def split(
     parent_indices: Tensor,
     level_indices: Dict[int, List[int]],
     revised_opacity: bool = False,
+    mask_root: Optional[Tensor] = None,
+    max_level: Optional[int] = None,
 ):
     """Inplace split the Gaussian with the given mask (multigrid version).
     
     Same as duplicate but with scale reduced by -0.5.
     Opacity is copied as-is (residual parameter, same level so same parent).
+    
+    If mask_root is provided, creates linear tree structure (1 child per level) 
+    from level 2 to max_level for root nodes in mask_root.
 
     Args:
         params: A dictionary of parameters.
@@ -165,6 +208,9 @@ def split(
         parent_indices: Tensor [N,] with parent index for each gaussian (-1 means no parent).
         level_indices: Dict mapping level -> list of gaussian indices at that level.
         revised_opacity: Whether to use revised opacity formulation from arXiv:2404.06109.
+        mask_root: Optional boolean mask indicating which gaussians in mask are roots.
+                  If provided along with max_level, creates linear tree children for these roots.
+        max_level: Maximum level in the hierarchy. Required if mask_root is provided.
     """
     device = mask.device
     sel = torch.where(mask)[0]
@@ -174,29 +220,57 @@ def split(
     sel_parents = parent_indices[sel]
 
     rest = torch.where(~mask)[0]
+    N_old = len(levels)
+
+    # Find children of selected gaussians that are parents (vectorized)
+    # For each sel[i], find all gaussians where parent_indices == sel[i]
+    # Using torch.isin for memory efficiency: O(N_old) memory instead of O(N_old * M)
+    valid_parent_mask = (parent_indices >= 0) & (parent_indices < N_old)
+    
+    if sel.numel() > 0:
+        # Check if parent_indices[i] is in sel
+        in_sel = torch.isin(parent_indices, sel)  # [N_old] bool
+        children_mask = in_sel & valid_parent_mask
+    else:
+        children_mask = torch.zeros(N_old, dtype=torch.bool, device=device)
+    
+    # Get indices of children
+    children_indices = torch.where(children_mask)[0]  # [M,] - indices of children
 
     splats = state["multigrid_gaussians"].get_splats(level=None, detach_parents=False, current_splats=None)
-    scales = splats["scales"][sel]
+    scales = torch.exp(splats["scales"][sel])
+
     quats = splats["quats"][sel]
     
     rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
     samples = torch.einsum(
-        "nij,nj,bnj->bni", rotmats, scales, torch.randn(2, len(scales), 3, device=device),
-    )  # [2, N, 3]
-
-    # opacities = splats["opacities"][sel]
-    # parents_opacities
+        "nij,nj,bnj->bni", 
+        rotmats, 
+        scales, 
+        torch.randn(2, len(scales), 3, device=device),
+    ) * 0.01  # [1, N, 3]
 
     del splats
 
-
     def param_fn(name: str, p: Tensor) -> Tensor:
         if name == "means":
-            p_split = (p[sel] + samples).reshape(-1, 3)  # [2N, 3]
+            p_split = (p[sel] + samples[0]).reshape(-1, 3)  # [2N, 3]
+            p[sel] += samples[1]
         elif name == "scales":
-            # Scale reduced by -0.5 (modify original and copy)
+            # Scale adjustment for split:
+            # - Split 대상의 scale을 -1.6 (normal split behavior)
+            # - 만약 split 대상이 parent라면, 그 children들의 residual scale을 +1.6 해서
+            #   children의 actual scale이 유지되도록 함
+            #   (children's actual_scale = parent_scale + child_residual)
+            #   parent_scale -= 1.6이면, child_residual += 1.6 해야 actual_scale 유지
+            
+            # Split 대상의 scale 감소
             p[sel] -= 1.6
-            # p[sel] = p[sel].mean(dim=-1, keepdim=True).repeat(1, 3)
+            
+            # Parent인 경우, children의 residual scale 증가 (actual scale 유지)
+            if len(children_indices) > 0:
+                p[children_indices] += 1.6
+            
             p_split = p[sel]
         # elif name == "opacities":
         #     # Opacity reduced by -0.5 (modify original and copy)
@@ -255,6 +329,157 @@ def split(
         multigrid_gaussians.parent_indices = new_parent_indices
         multigrid_gaussians.level_indices = level_indices_new
         # Invalidate cache after densification
+        multigrid_gaussians.invalidate_splats_cache()
+    
+    # If mask_root is provided, create linear tree structure for root nodes
+    if mask_root is not None and max_level is not None:
+        # Update structure after split
+        levels = state["levels"]
+        parent_indices = state["parent_indices"]
+        level_indices = state["level_indices"]
+        N_old = len(levels)
+        
+        # Get split gaussians that are roots (they are at the end)
+        # mask_root indicates which gaussians in mask were roots
+        # After split, these are at indices [N_old - len(sel_root), N_old)
+        # where sel_root are the root gaussians from the original mask
+        sel_root = torch.where(mask_root)[0]  # Original indices of root gaussians in mask
+        if len(sel_root) > 0:
+            # After split, root gaussians are at the end: [N_old - len(sel_root), N_old)
+            split_start_idx = N_old - len(sel_root)
+            split_indices = torch.arange(split_start_idx, N_old, device=mask.device)
+            
+            # Create linear tree structure for split roots
+            _create_linear_tree_children(
+                params=params,
+                optimizers=optimizers,
+                state=state,
+                root_indices=split_indices,
+                levels=levels,
+                parent_indices=parent_indices,
+                level_indices=level_indices,
+                max_level=max_level,
+            )
+
+
+@torch.no_grad()
+def _create_linear_tree_children(
+    params: Union[Dict[str, torch.nn.Parameter], torch.nn.ParameterDict],
+    optimizers: Dict[str, torch.optim.Optimizer],
+    state: Dict[str, Tensor],
+    root_indices: Tensor,
+    levels: Tensor,
+    parent_indices: Tensor,
+    level_indices: Dict[int, List[int]],
+    max_level: int,
+):
+    """Create linear tree structure (1 child per level) from level 2 to max_level for given root indices.
+    
+    For each root, creates a chain: root -> L2 -> L3 -> ... -> max_level
+    All children are initialized with zero residual parameters.
+    
+    Args:
+        params: A dictionary of parameters.
+        optimizers: A dictionary of optimizers, each corresponding to a parameter.
+        state: State dictionary that may contain level_indices, levels, parent_indices.
+        root_indices: Tensor [M,] with indices of root gaussians to create children for.
+        levels: Tensor [N,] with level for each gaussian.
+        parent_indices: Tensor [N,] with parent index for each gaussian (-1 means no parent).
+        level_indices: Dict mapping level -> list of gaussian indices at that level.
+        max_level: Maximum level in the hierarchy.
+    """
+    if len(root_indices) == 0:
+        return
+    
+    device = root_indices.device
+    N_old = len(levels)
+    
+    # For each root, create linear tree from level 2 to max_level
+    # Each level gets 1 child, creating a chain: root -> L2 -> L3 -> ... -> max_level
+    total_children_to_create = len(root_indices) * (max_level - 1)  # (max_level - 1) children per root
+    
+    if total_children_to_create == 0:
+        return
+    
+    # Prepare parent indices for children (linear tree structure)
+    # For each root, create children at levels 2, 3, ..., max_level
+    # Structure: root[i] -> child_L2[i] -> child_L3[i] -> ... -> child_max_level[i]
+    children_parent_indices = []
+    children_levels = []
+    
+    for i, root_idx in enumerate(root_indices):
+        # First child (level 2) points to root
+        children_parent_indices.append(root_idx)
+        children_levels.append(2)
+        
+        # Subsequent children form a chain: each child points to previous child
+        for child_level in range(3, max_level + 1):
+            # Parent is the previous child in the chain
+            # Index calculation: N_old (current size) + i * (max_level - 1) + (child_level - 3)
+            # This will be the index of the previous child after all children are added
+            prev_child_idx = N_old + i * (max_level - 1) + (child_level - 3)
+            children_parent_indices.append(prev_child_idx)
+            children_levels.append(child_level)
+    
+    children_parent_indices = torch.tensor(children_parent_indices, dtype=torch.long, device=device)
+    children_levels = torch.tensor(children_levels, dtype=torch.long, device=device)
+    
+    def param_fn(name: str, p: Tensor) -> Tensor:
+        if name == "means":
+            # Zero residual means
+            p_children = torch.zeros((total_children_to_create, 3), device=device, dtype=p.dtype)
+        elif name == "scales":
+            # Zero residual scales
+            p_children = torch.zeros((total_children_to_create, 3), device=device, dtype=p.dtype)
+        elif name == "quats":
+            # Identity quaternion (zero residual rotation)
+            identity_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=device, dtype=p.dtype)
+            p_children = identity_quat.unsqueeze(0).repeat(total_children_to_create, 1)
+        elif name == "opacities":
+            # Zero residual opacities
+            p_children = torch.zeros((total_children_to_create,), device=device, dtype=p.dtype)
+        else:
+            # For other parameters (sh0, shN, etc.), initialize to zero (residual)
+            p_children = torch.zeros((total_children_to_create, *p.shape[1:]), device=device, dtype=p.dtype)
+        
+        p_new = torch.cat([p, p_children])
+        return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
+    
+    def optimizer_fn(key: str, v: Tensor) -> Tensor:
+        v_children = torch.zeros((total_children_to_create, *v.shape[1:]), device=device)
+        return torch.cat([v, v_children])
+    
+    # Update parameters and optimizers
+    _update_param_with_optimizer(param_fn, optimizer_fn, params, optimizers)
+    
+    # Update state (exclude hierarchical structure, handled separately)
+    for k, v in state.items():
+        if isinstance(v, torch.Tensor) and k not in ["levels", "parent_indices", "level_indices"]:
+            v_children = torch.zeros((total_children_to_create, *v.shape[1:]), device=device, dtype=v.dtype)
+            state[k] = torch.cat([v, v_children])
+    
+    # Update hierarchical structure
+    new_levels = torch.cat([levels, children_levels])
+    new_parent_indices = torch.cat([parent_indices, children_parent_indices])
+    
+    # Update level_indices
+    level_indices_new = {}
+    for level_val in new_levels.unique():
+        level_val_int = level_val.item()
+        mask_level = (new_levels == level_val_int)
+        level_indices_new[level_val_int] = torch.where(mask_level)[0].tolist()
+    
+    # Update state
+    state["levels"] = new_levels
+    state["parent_indices"] = new_parent_indices
+    state["level_indices"] = level_indices_new
+    
+    # Update multigrid_gaussians object if present
+    if "multigrid_gaussians" in state and state["multigrid_gaussians"] is not None:
+        multigrid_gaussians = state["multigrid_gaussians"]
+        multigrid_gaussians.levels = new_levels
+        multigrid_gaussians.parent_indices = new_parent_indices
+        multigrid_gaussians.level_indices = level_indices_new
         multigrid_gaussians.invalidate_splats_cache()
 
 

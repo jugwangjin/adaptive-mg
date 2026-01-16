@@ -1,47 +1,12 @@
 """
-vcycle_trainer_v6.py - Multigrid V-cycle Trainer with Residual Equation
+coarse_to_fine_trainer.py - Coarse-to-Fine Multigrid Trainer
 
-VERSION HISTORY AND KEY DIFFERENCES:
-
-v6 (Current):
-    - **Multigrid Residual Equation Implementation**: 
-      * Core multigrid concept: solve residual equation at coarse level
-      * residual_color = render_current - GT (computed in _train_step)
-      * residual_target = GT - render_finer (computed in _train_step)
-      * Loss: ||residual_color + residual_target|| = ||(render_current - GT) + (GT - render_finer)||
-      * This ensures render_current matches render_finer (multigrid goal)
-    
-    - **Residual Calculation in _train_step**:
-      * Finer level rendering happens inside _train_step (view changes every step)
-      * residual_target computed per training step, not per smoothing step
-      * Properly handles view-dependent residual calculation
-    
-    - **Refactored Restriction Logic**:
-      * Uses MultigridGaussians.restrict_parameters() helper function
-      * Cleaner code with proper handling of:
-        - means: scaling with position_scale_reduction
-        - scales: -1.4 offset handling
-        - quats: quaternion multiplication
-        - other params: simple addition
-    
-    - **All Parameters are Residual**:
-      * means, scales, quats, opacities, sh0, shN all use residual formulation
-      * Child = parent + residual (with special handling for means/scales/quats)
-    
-    - **multigrid_gaussians_v2**: Uses v2 with helper functions for parent<->child conversion
-    
-    - **Result Directory**: Includes "v6" and "randbkgd" flag in path
-
-v5 (Previous):
-    - Used simple GT loss even for non-finest levels
-    - Residual calculation was done outside _train_step (incorrect for view changes)
-    - Restriction logic was verbose and repetitive
-    - May have had some parameters as independent rather than residual
-
-v4 and earlier:
-    - Basic V-cycle implementation
-    - May have had different parameter handling
-    - Different restriction/prolongation strategies
+This trainer implements a coarse-to-fine training approach for hierarchical Gaussian Splatting:
+    - Training progresses from coarse levels to fine levels based on step count
+    - Target level is determined by: min(1 + step // level_interval, max_level)
+    - Standard GT loss is used (no residual equation)
+    - Children are pre-created during initialization (multigrid_gaussians_v3)
+    - Densification rules: duplication/split when parent is not full, signal parent when full
 """
 
 import json
@@ -82,10 +47,10 @@ from gsplat.compression import PngCompression
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
-from gsplat.strategy.multigrid_v8 import MultigridStrategy
+from gsplat.strategy.multigrid_v9 import MultigridStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
-from multigrid_gaussians_v2 import MultigridGaussians, quaternion_multiply
+from multigrid_gaussians_v3 import MultigridGaussians, quaternion_multiply
 
 opacity_grad_norms = []
 
@@ -133,11 +98,12 @@ class Config:
 
     # Number of training steps
     max_steps: int = 30_000
-    # Cycles to evaluate the model (evaluation happens at the end of each cycle)
-    eval_cycles: List[int] = field(default_factory=lambda: [])
-    # Interval for metric measurement (every N cycles). -1 means disable metric measurement.
-    # Evaluation is performed at the end of each cycle, not during cycle execution.
-    metric_interval_cycles: int = 3
+    # Steps to evaluate the model
+    eval_steps: List[int] = field(default_factory=lambda: [30_000])
+    # Interval for metric measurement (every N steps). -1 means disable metric measurement.
+    metric_interval: int = 250
+    # Coarse-to-fine: interval for switching to next level (every N steps)
+    level_interval: int = 3500
     # Steps to save the model
     save_steps: List[int] = field(default_factory=lambda: [30_000])
     # Whether to save ply file (storage size can be large)
@@ -209,7 +175,7 @@ class Config:
     scale_reg: float = 0.0
     # Position scale reduction for hierarchical gaussians
     # Higher level gaussians are constrained to stay closer to their parents
-    position_scale_reduction: float = 0.75
+    position_scale_reduction: float = 1
     # Maximum level for hierarchical structure
     # If set, gaussians at max_level will only duplicate (not split) even if split conditions are met
     max_level: Optional[int] = 4
@@ -219,24 +185,13 @@ class Config:
     # Parent sampling method: "uniform" or "fps" (farthest point sampling)
     parent_sampling_method: Literal["uniform", "fps"] = "fps"
     
-    # Cycle type: "vcycle" or "inv_fcycle"
-    cycle_type: Literal["vcycle", "inv_fcycle"] = "vcycle"
-    
-    # V-cycle parameters
-    smoothing_steps: int = 32  # Number of smoothing steps per level (fixed at 100 for V-cycle)
-    solving_steps: int = 32  # Number of solving steps at coarsest level (fixed at 100 for V-cycle)
-    steps_decaying_per_level: float = 0.5
-    restriction_dampling: float = 1
-    
-    # Strategy parameters (set based on cycle_type in __post_init__)
-    # For V-cycle: reset_every=60, refine_every=2, pause_refine_after_reset=2
-    # For inv-F cycle: reset_every=30, refine_every=1, pause_refine_after_reset=1
-    reset_every: Optional[int] = None  # Reset opacities every N cycles (auto-set based on cycle_type)
-    refine_every: Optional[int] = None  # Refine GSs every N cycles (auto-set based on cycle_type)
-    pause_refine_after_reset: Optional[int] = None  # Pause refining for N cycles after reset (auto-set based on cycle_type)
+    # Strategy parameters
+    reset_every: int = 3000  # Reset opacities every N steps
+    refine_every: int = 100  # Refine GSs every N steps
+    pause_refine_after_reset: int = 100  # Pause refining for N steps after reset
     
     # Gradient scaling parameters
-    grad_scale_factor: float = 0.95 # Base factor for level-dependent gradient scaling
+    grad_scale_factor: float = 1 # Base factor for level-dependent gradient scaling
     # Gradient scale for level L: grad_scale_factor ** (max_level - L)
     # Coarse levels (low L) get larger scale, fine levels (high L) get smaller scale
 
@@ -282,15 +237,13 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
-    # Visualization: save visualization images (GT vs render) at the end of each cycle
-    # If > 0, saves visualization after each cycle completion
-    visualization_interval: int = 1  # 1 = every cycle, 0 = disabled
-    # Visualization: save hierarchy visualization (level pointclouds and linesets) at the end of each cycle
-    # If > 0, saves hierarchy visualization after each cycle completion
-    hierarchy_visualization_interval: int = 50  # 1 = every cycle, 0 = disabled
+    # Visualization: interval to save visualization images (GT vs render)
+    visualization_interval: int = 200
+    # Visualization: interval to save hierarchy visualization (level pointclouds and linesets)
+    hierarchy_visualization_interval: int = 1000
 
     def __post_init__(self):
-        """Auto-generate result_dir if not provided and set strategy parameters based on cycle_type."""
+        """Auto-generate result_dir if not provided."""
         from pathlib import Path
         
         if self.data_dir is None:
@@ -309,7 +262,7 @@ class Config:
             settings_parts = [
                 f"type_{self.dataset_type}",
                 f"factor_{self.data_factor}",
-                "v11",
+                "coarse_to_fine",
             ]
             if self.dataset_type == "nerf" and self.white_background:
                 settings_parts.append("whitebg")
@@ -321,40 +274,15 @@ class Config:
                 settings_parts.append(f"patch_{self.patch_size}")
             
             settings_str = "_".join(settings_parts)
-            self.result_dir = f"/Bean/log/gwangjin/2025/gsplat/multigrid_{self.cycle_type}/{dataset_name}_{settings_str}"
-        
-        # Set strategy parameters based on cycle_type if not explicitly provided
-        if self.reset_every is None:
-            if self.cycle_type == "vcycle":
-                self.reset_every = 30
-            elif self.cycle_type == "inv_fcycle":
-                self.reset_every = 20
-            else:
-                raise ValueError(f"Unknown cycle_type: {self.cycle_type}")
-        
-        if self.refine_every is None:
-            if self.cycle_type == "vcycle":
-                self.refine_every = 1
-            elif self.cycle_type == "inv_fcycle":
-                self.refine_every = 1
-            else:
-                raise ValueError(f"Unknown cycle_type: {self.cycle_type}")
-        
-        if self.pause_refine_after_reset is None:
-            if self.cycle_type == "vcycle":
-                self.pause_refine_after_reset = 2
-            elif self.cycle_type == "inv_fcycle":
-                self.pause_refine_after_reset = 1
-            else:
-                raise ValueError(f"Unknown cycle_type: {self.cycle_type}")
+            self.result_dir = f"/Bean/log/gwangjin/2025/gsplat/coarse_to_fine/{dataset_name}_{settings_str}"
 
     def adjust_steps(self, factor: float):
-        # Note: eval_cycles and metric_interval_cycles are not scaled by factor
-        # as they are cycle-based, not step-based
+        self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
         self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
+        self.level_interval = int(self.level_interval * factor)
 
         strategy = self.strategy
         if isinstance(strategy, MultigridStrategy):
@@ -375,441 +303,14 @@ class Config:
             assert_never(strategy)
 
 
-def vcycle_recursive(
-    current_step: int,
-    level: int,
-    coarsest_level: int,
-    max_level: int,
-    smoothing_steps: int,
-    solving_steps: int,
-    total_steps: int,
-    runner: "Runner",
-    trainloader_iter,
-    schedulers: List,
-    cfg: Config,
-    pbar: Optional[tqdm.tqdm] = None,
-    vcycle_idx: int = 0,
-    losses: Optional[List[float]] = None,
-    global_tic: Optional[float] = None,
-) -> Tuple[int, List[float]]:
-    """
-    Recursive V-cycle: max_level -> coarsest_level -> max_level.
-    
-    V-cycle structure (recursive):
-    - Base case: level == coarsest_level -> perform solving
-    - Recursive case:
-      1. Downward: Smooth at current level -> Restrict -> Recurse to level-1
-      2. Upward: Return from recursion -> Smooth at current level
-    
-    Args:
-        current_step: Current training step (will be updated)
-        level: Current level in the V-cycle
-        coarsest_level: Coarsest LOD level for this V-cycle
-        max_level: Maximum LOD level (finest)
-        smoothing_steps: Number of smoothing steps per level
-        solving_steps: Number of solving steps at coarsest level
-        total_steps: Maximum number of steps
-        runner: Runner instance for training
-        trainloader_iter: Training data iterator
-        schedulers: List of learning rate schedulers
-        cfg: Config object
-        pbar: Optional progress bar
-        vcycle_idx: V-cycle index for display
-        losses: List of losses (accumulated across recursion)
-    
-    Returns:
-        current_step: Updated current step
-        losses: List of losses during this V-cycle
-    """
-    if losses is None:
-        losses = []
-    
-    # Base case: coarsest level - perform solving
-    if level == coarsest_level:
-        # ========== Coarsest Level Solving ==========
-        current_solving_steps = int(solving_steps * (cfg.steps_decaying_per_level ** (max_level - level)))
-        current_solving_steps = max(1, current_solving_steps)
-        for solving_step in range(current_solving_steps):
-            # Continue V-cycle even if max_steps is reached (complete the cycle)
-            try:
-                data = next(trainloader_iter)
-            except StopIteration:
-                trainloader_iter = iter(runner.trainloader)
-                data = next(trainloader_iter)
-            
-            log_step = min(current_step, total_steps - 1) if total_steps > 0 else current_step
-            
-            loss = runner._train_step(
-                step=log_step,
-                data=data,
-                target_level=level,
-                global_tic=global_tic,
-            )
-            losses.append(loss)
-            
-            # Only increment step and scheduler if not past max_steps
-            if current_step < total_steps:
-                for scheduler in schedulers:
-                    scheduler.step()
-                current_step += 1
-            
-            if pbar is not None:
-                pbar.update(1)
-                avg_loss = np.mean(losses) if losses else 0.0
-                desc = f"V-cycle {vcycle_idx}| Solve L{level}| loss={avg_loss:.3f}| step={current_step}/{total_steps}"
-                pbar.set_description(desc)
-        
-        return current_step, losses
-    
-    # Recursive case: Downward pass (smoothing + restriction) -> recurse -> upward pass (smoothing)
-    
-    # ========== Downward: Smoothing at current level ==========
-    target_level = level
-    
-    # Save initial values before smoothing
-    runner.multigrid_gaussians.set_visible_mask(target_level)
-    visible_mask = runner.multigrid_gaussians.visible_mask  # [N,]
-    parent_indices = runner.multigrid_gaussians.parent_indices  # [N,]
-    has_parent = (parent_indices != -1)  # [N,]
-    
-    # Get valid indices: visible gaussians with valid parents
-    valid_mask = visible_mask & has_parent  # [N,]
-    valid_indices = torch.where(valid_mask)[0]  # [K,]
-    
-    if len(valid_indices) == 0:
-        # No valid gaussians, skip restriction and recurse to coarser level
-        # Free intermediate variables before recursive call
-        del visible_mask, parent_indices, has_parent, valid_mask, valid_indices
-        torch.cuda.empty_cache()
-        
-        current_step, losses = vcycle_recursive(
-            current_step=current_step,
-            level=level - 1,
-            coarsest_level=coarsest_level,
-            max_level=max_level,
-            smoothing_steps=smoothing_steps,
-            solving_steps=solving_steps,
-            total_steps=total_steps,
-            runner=runner,
-            trainloader_iter=trainloader_iter,
-            schedulers=schedulers,
-            cfg=cfg,
-            pbar=pbar,
-            vcycle_idx=vcycle_idx,
-            losses=losses,
-        )
-        # Continue with upward pass (will be handled after restriction block)
-        return current_step, losses
-    
-    # Get initial hierarchical values for valid gaussians
-    # No gradients needed for restriction (only parameter updates)
-    # Always use current optimized splats (cache is just a hint, computation uses current values)
-    with torch.no_grad():
-        # Pass current_splats=None to use self.splats (which contains current optimized values)
-        initial_splats = runner.multigrid_gaussians.get_splats(level=None, detach_parents=True, current_splats=None)
-        # Store initial values in dict
-        param_keys = ["means", "scales", "quats", "sh0", "shN", "opacities"]
-        initial_params = {key: initial_splats[key][valid_indices].clone().detach() for key in param_keys}
-        # Free initial_splats immediately after extracting needed values
-        del initial_splats
-    current_smoothing_steps = int(smoothing_steps * (cfg.steps_decaying_per_level ** (max_level - level)))
-    current_smoothing_steps = max(1, current_smoothing_steps)
-    # Smoothing steps at current level
-    # Residual calculation is now done inside _train_step (view changes every step)
-    for smoothing_step in range(current_smoothing_steps):
-        # Continue V-cycle even if max_steps is reached (complete the cycle)
-        try:
-            data = next(trainloader_iter)
-        except StopIteration:
-            trainloader_iter = iter(runner.trainloader)
-            data = next(trainloader_iter)
-        
-        log_step = min(current_step, total_steps - 1) if total_steps > 0 else current_step
-        
-        loss = runner._train_step(
-            step=log_step,
-            data=data,
-            target_level=target_level,
-            global_tic=global_tic,
-        )
-        losses.append(loss)
-        
-        # Only increment step and scheduler if not past max_steps
-        if current_step < total_steps:
-            for scheduler in schedulers:
-                scheduler.step()
-            current_step += 1
-        
-        if pbar is not None:
-            pbar.update(1)
-            avg_loss = np.mean(losses) if losses else 0.0
-            desc = f"V-cycle {vcycle_idx}| Down L{target_level}| loss={avg_loss:.3f}| step={current_step}/{total_steps}"
-            pbar.set_description(desc)
-    
-    # ========== Restriction: Transfer fine level changes to coarse level ==========
-    # This operation updates parameter values only, no gradients needed
-    # Use no_grad to prevent computation graph accumulation in recursive calls
-    with torch.no_grad():
-        # Get final hierarchical values after smoothing
-        # Always use current optimized splats (no caching during optimization)
-        final_splats = runner.multigrid_gaussians.get_splats(level=None, detach_parents=True, current_splats=None)
-        
-        # Calculate changes (delta) for all residual parameters
-        # All parameters are now residual: means, scales, quats, opacities, sh0, shN
-        child_deltas = {}
-        for key in param_keys:
-            child_deltas[key] = (final_splats[key][valid_indices] - initial_params[key]) * cfg.restriction_dampling
-        
-        # Free intermediate tensors
-        del final_splats
-        
-        # Get parent indices and child levels for valid gaussians
-        valid_parent_indices = parent_indices[valid_indices]  # [K,]
-        valid_child_levels = runner.multigrid_gaussians.levels[valid_indices]  # [K,]
-        valid_parent_levels = runner.multigrid_gaussians.levels[valid_parent_indices]  # [K,]
-        
-        # Use restrict_parameters helper function
-        # Note: parent_level = child_level - 1 (always), so we don't need to pass parent_levels
-        parent_deltas = MultigridGaussians.restrict_parameters(
-            child_params=child_deltas,
-            parent_indices=valid_parent_indices,
-            child_levels=valid_child_levels,
-            position_scale_reduction=runner.multigrid_gaussians.position_scale_reduction,
-            parent_levels=valid_parent_levels,
-        )
-        
-        # Apply parent deltas to parent parameters
-        for key in param_keys:
-            # For other parameters: parent_param_new = parent_param_old + parent_delta
-            runner.splats[key].data[valid_parent_indices] += parent_deltas[key][valid_parent_indices] 
-        
-        # Subtract changes from fine level parameters (to maintain optimized hierarchical values)
-        # This ensures that fine level still renders with optimized values after restriction
-        # Note: child_deltas already has damping applied (line 561), so don't apply damping again
-        for key in param_keys:
-            if key == "means":
-                # For means, we need to compensate for parent's movement to maintain absolute position
-                # Get scale_factor for each child
-                scale_factor = runner.multigrid_gaussians.position_scale_reduction ** (valid_child_levels.float() - 1)
-                scale_factor = scale_factor.unsqueeze(-1)  # [K, 1] for broadcasting
-                
-                # child_deltas already has damping applied, so just divide by scale_factor
-                runner.splats[key].data[valid_indices] -= child_deltas[key] / scale_factor.clamp_min(1e-8)
-                del scale_factor
-            else:
-                # For other parameters (including quats): child_residual_new = child_residual_old - child_delta
-                # child_deltas already has damping applied, so use it directly
-                # Quats use addition (normalize will be applied later)
-                runner.splats[key].data[valid_indices] -= child_deltas[key]
-        
-        # Free all intermediate variables after restriction
-        del child_deltas, parent_deltas, initial_params
-        del valid_parent_indices, valid_child_levels
-        
-        # Free restriction-related variables before recursive call
-        del valid_mask
-        # Invalidate cache after parameter updates
-        runner.multigrid_gaussians.invalidate_splats_cache()
-        torch.cuda.empty_cache()
-    
-    # ========== Recurse to coarser level ==========
-    # Note: visible_mask, parent_indices, has_parent, valid_indices are still needed for upward pass
-    # but we can free them after recursive call if not needed
-    current_step, losses = vcycle_recursive(
-        current_step=current_step,
-        level=level - 1,
-        coarsest_level=coarsest_level,
-        max_level=max_level,
-        smoothing_steps=smoothing_steps,
-        solving_steps=solving_steps,
-        total_steps=total_steps,
-        runner=runner,
-        trainloader_iter=trainloader_iter,
-        schedulers=schedulers,
-        cfg=cfg,
-        pbar=pbar,
-        vcycle_idx=vcycle_idx,
-        losses=losses,
-        global_tic=global_tic,
-    )
-    
-    # Free variables that are no longer needed after recursive call
-    # (visible_mask, parent_indices, has_parent are not used in upward pass)
-    del visible_mask, parent_indices, has_parent
-    
-    # Note: Prolongation is not needed for residual parameters
-    # Coarse level changes are automatically reflected in fine level through get_splats
-    # which uses parent's current residual values when computing hierarchical structure
-    
-    # ========== Upward: Smoothing at current level ==========
-    # Smoothing steps at current level (after returning from coarser level)
-    current_smoothing_steps = int(smoothing_steps * (cfg.steps_decaying_per_level ** (max_level - level)))
-    current_smoothing_steps = max(1, current_smoothing_steps)
-    for smoothing_step in range(current_smoothing_steps):
-        # Continue V-cycle even if max_steps is reached (complete the cycle)
-        try:
-            data = next(trainloader_iter)
-        except StopIteration:
-            trainloader_iter = iter(runner.trainloader)
-            data = next(trainloader_iter)
-        
-        log_step = min(current_step, total_steps - 1) if total_steps > 0 else current_step
-        
-        loss = runner._train_step(
-            step=log_step,
-            data=data,
-            target_level=target_level,
-            global_tic=global_tic,
-        )
-        losses.append(loss)
-        
-        # Only increment step and scheduler if not past max_steps
-        if current_step < total_steps:
-            for scheduler in schedulers:
-                scheduler.step()
-            current_step += 1
-        
-        if pbar is not None:
-            pbar.update(1)
-            avg_loss = np.mean(losses) if losses else 0.0
-            desc = f"V-cycle {vcycle_idx}| Up L{target_level}| loss={avg_loss:.3f}| step={current_step}/{total_steps}"
-            pbar.set_description(desc)
-    
-    return current_step, losses
-
-
-def perform_vcycle(
-    current_step: int,
-    max_level: int,
-    coarsest_level: int,
-    smoothing_steps: int,
-    solving_steps: int,
-    total_steps: int,
-    runner: "Runner",
-    trainloader_iter,
-    schedulers: List,
-    cfg: Config,
-    pbar: Optional[tqdm.tqdm] = None,
-    vcycle_idx: int = 0,
-    global_tic: Optional[float] = None,
-) -> Tuple[int, List[float]]:
-    """
-    Perform a single V-cycle: max_level -> coarsest_level -> max_level.
-    
-    Wrapper function that calls the recursive V-cycle implementation.
-    
-    Args:
-        current_step: Current training step (will be updated)
-        max_level: Maximum LOD level (finest)
-        coarsest_level: Coarsest LOD level for this V-cycle
-        smoothing_steps: Number of smoothing steps per level
-        solving_steps: Number of solving steps at coarsest level
-        total_steps: Maximum number of steps
-        runner: Runner instance for training
-        trainloader_iter: Training data iterator
-        schedulers: List of learning rate schedulers
-        cfg: Config object
-        pbar: Optional progress bar
-        vcycle_idx: V-cycle index for display
-    
-    Returns:
-        current_step: Updated current step
-        losses: List of losses during this V-cycle
-    """
-    # Ensure coarsest_level is valid
-    coarsest_level = max(1, min(coarsest_level, max_level))  # Clamp to [1, max_level]
-    
-    # Call recursive V-cycle starting from max_level
-    return vcycle_recursive(
-        current_step=current_step,
-        level=max_level,
-        coarsest_level=coarsest_level,
-        max_level=max_level,
-        smoothing_steps=smoothing_steps,
-        solving_steps=solving_steps,
-        total_steps=total_steps,
-        runner=runner,
-        trainloader_iter=trainloader_iter,
-        schedulers=schedulers,
-        cfg=cfg,
-        pbar=pbar,
-        vcycle_idx=vcycle_idx,
-        losses=[],
-        global_tic=global_tic,
-    )
-
-
-def perform_inv_fcycle(
-    current_step: int,
-    max_level: int,
-    smoothing_steps: int,
-    solving_steps: int,
-    total_steps: int,
-    runner: "Runner",
-    trainloader_iter,
-    schedulers: List,
-    cfg: Config,
-    pbar: Optional[tqdm.tqdm] = None,
-    cycle_idx: int = 0,
-    global_tic: Optional[float] = None,
-) -> Tuple[int, List[float]]:
-    """
-    Perform an inv-F cycle: finest~coarsest -> finest~(coarsest+1) -> ... -> finest~finest.
-    
-    This performs multiple V-cycles with increasing coarsest_level:
-    - Cycle 1: finest -> 1 -> finest
-    - Cycle 2: finest -> 2 -> finest
-    - ...
-    - Cycle N: finest -> finest -> finest (single level)
-    
-    Args:
-        current_step: Current training step (will be updated)
-        max_level: Maximum LOD level (finest)
-        smoothing_steps: Number of smoothing steps per level
-        solving_steps: Number of solving steps at coarsest level
-        total_steps: Maximum number of steps
-        runner: Runner instance for training
-        trainloader_iter: Training data iterator
-        schedulers: List of learning rate schedulers
-        cfg: Config object
-        pbar: Optional progress bar
-        cycle_idx: Cycle index for display
-    
-    Returns:
-        current_step: Updated current step
-        losses: List of losses during this inv-F cycle
-    """
-    all_losses = []
-    
-    # Perform V-cycles with increasing coarsest_level: 1, 2, ..., max_level
-    for coarsest_level in range(1, max_level + 1):
-        # Perform a single V-cycle with this coarsest_level
-        current_step, cycle_losses = perform_vcycle(
-            current_step=current_step,
-            max_level=max_level,
-            coarsest_level=coarsest_level,
-            smoothing_steps=smoothing_steps,
-            solving_steps=solving_steps,
-            total_steps=total_steps,
-            runner=runner,
-            trainloader_iter=trainloader_iter,
-            schedulers=schedulers,
-            cfg=cfg,
-            pbar=pbar,
-            vcycle_idx=cycle_idx,  # Use cycle_idx for display
-            global_tic=global_tic,
-        )
-        all_losses.extend(cycle_losses)
-        
-        # Stop if we've exceeded max_steps
-        if current_step >= total_steps:
-            break
-    
-    return current_step, all_losses
+# V-cycle functions removed - using coarse-to-fine training instead
+# These functions are no longer needed for coarse-to-fine training
+# Removed: vcycle_recursive, perform_vcycle, perform_inv_fcycle
+# They are replaced by simple step-based training with level selection
 
 
 class Runner:
-    """Engine for training and testing with hierarchical Gaussians using V-cycle multigrid."""
+    """Engine for training and testing with hierarchical Gaussians using coarse-to-fine training."""
 
     def __init__(
         self, local_rank: int, world_rank, world_size: int, cfg: Config
@@ -870,8 +371,26 @@ class Runner:
             )
             self.valset = NerfDataset(self.parser, split="val")
         else:
-            raise ValueError(f"Unknown dataset type: {cfg.dataset_type}")
-        
+            raise ValueError(f"Unknown dataset_type: {cfg.dataset_type}")
+
+        # Create trainloader (similar to simple_trainer.py)
+        self.trainloader = torch.utils.data.DataLoader(
+            self.trainset,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=4,
+            persistent_workers=True,
+            pin_memory=True,
+            drop_last=True,
+        )
+        self.valloader = torch.utils.data.DataLoader(
+            self.valset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=1,
+            pin_memory=True,
+        )
+
         # Sample 3 cameras from test set for visualization
         if cfg.visualization_interval > 0:
             val_indices = list(range(len(self.valset)))
@@ -929,10 +448,13 @@ class Runner:
             self.cfg.strategy.max_children_per_parent = self.cfg.max_children_per_parent
             self.cfg.strategy.grad_threshold_decay_rate = self.cfg.grad_threshold_decay_rate
             self.cfg.strategy.max_level = self.cfg.max_level if self.cfg.max_level is not None else self.cfg.strategy.max_level
-            # Set strategy parameters from config (set in __post_init__ based on cycle_type)
-            self.cfg.strategy.reset_every = self.cfg.reset_every
-            self.cfg.strategy.refine_every = self.cfg.refine_every
-            self.cfg.strategy.pause_refine_after_reset = self.cfg.pause_refine_after_reset
+            # Set strategy parameters (cycle-based, not step-based)
+            # Note: cfg.refine_every is step-based (when to call post_cycle)
+            #       strategy.refine_every is cycle-based (how often to densify within post_cycle)
+            # For coarse-to-fine: every refine_every steps = 1 cycle, so we set strategy to densify every cycle
+            self.cfg.strategy.refine_every = 1  # Cycle-based: densify every cycle (1 cycle = refine_every steps)
+            self.cfg.strategy.pause_refine_after_reset = 1  # Cycle-based: pause for 1 cycle after reset
+            self.cfg.strategy.reset_every = 30  # Cycle-based: reset every 30 cycles
             # If opacity_reg > 0, disable opacity reset (opacity regularization handles opacity control)
             if self.cfg.opacity_reg > 0.0:
                 self.cfg.strategy.use_opacity_reset = False
@@ -1230,19 +752,14 @@ class Runner:
         self,
         step: int,
         data: Dict,
-        target_level: int,
         global_tic: Optional[float] = None,
     ) -> float:
         """
-        Perform a single training step at a specific LOD level.
-        
-        For multigrid: if not finest level, computes residual from finer level and uses
-        residual_target = GT - render_finer as training objective.
+        Perform a single training step with coarse-to-fine level selection.
         
         Args:
             step: Current training step
             data: Training data dictionary
-            target_level: LOD level to render at
         
         Returns:
             loss: Training loss
@@ -1251,6 +768,11 @@ class Runner:
         device = self.device
         world_rank = self.world_rank
         world_size = self.world_size
+        
+        # Calculate target_level based on step (coarse-to-fine)
+        # level 1 at step 0, level 2 at step level_interval, level 3 at step 2*level_interval, etc.
+        max_level = cfg.max_level if cfg.max_level is not None else 1
+        target_level = min(1 + step // cfg.level_interval, max_level)
         
         camtoworlds_gt = data["camtoworld"].to(device)  # [4, 4] or [1, 4, 4]
         Ks = data["K"].to(device)  # [3, 3] or [1, 3, 3]
@@ -1270,8 +792,6 @@ class Runner:
             image_data = image_data.unsqueeze(0)  # [H, W, C] -> [1, H, W, C]
         
         # Get max_level for image multigrid downsample
-        # Use cfg.max_level (not actual multigrid_gaussians.levels.max())
-        # multigrid_gaussians.levels.max() is only used for V-cycle level selection
         image_multigrid_max_level = cfg.max_level if cfg.max_level is not None else 1
         
         # Store original dimensions before any downsampling
@@ -1335,78 +855,11 @@ class Runner:
         if Ks_original.dim() == 2:
             Ks_original = Ks_original.unsqueeze(0)  # [3, 3] -> [1, 3, 3]
         
-        # Multigrid residual calculation: if not finest level, compute residual from finer level
-        # This must be done in _train_step because view changes every step
-        residual_target = None
-        finer_colors_downsampled = None
-        max_level_to_use = cfg.max_level if cfg.max_level is not None else image_multigrid_max_level
-        if False and target_level < max_level_to_use:
-            # Render finer level (target_level + 1) to compute residual target
-            # Finer level should be rendered at its own resolution (target_level + 1)
-            with torch.no_grad():
-                # Render finer level at target_level + 1 resolution
-                finer_colors, finer_pixels_downsampled, finer_alphas, _ = self.render_at_level(
-                    target_level=target_level + 1,
-                    pixels_gt=pixels,
-                    original_height=original_height,
-                    original_width=original_width,
-                    camtoworlds=camtoworlds,
-                    Ks_original=Ks_original,
-                    image_multigrid_max_level=image_multigrid_max_level,
-                    sh_degree=sh_degree_to_use,
-                    near_plane=cfg.near_plane,
-                    far_plane=cfg.far_plane,
-                    image_ids=image_ids,
-                    masks=masks,
-                    render_mode="RGB",
-                    force_original_resolution=False,  # Render at target_level + 1 resolution
-                )
-                
-                if cfg.white_background or cfg.random_bkgd:
-                    finer_colors = finer_colors + backgrounds * (1.0 - finer_alphas)
-
-                # Compute residual at finer level resolution
-                # Residual target = GT_downsampled_to_finer - render_finer (at finer level resolution)
-                residual_target_finer = finer_pixels_downsampled - finer_colors  # [1, H_finer, W_finer, 3]
-                
-                # Downsample residual from finer level resolution to current target level resolution
-                # target_level + 1 has 2x higher resolution than target_level
-                finer_downsample = 2 ** (image_multigrid_max_level - (target_level + 1))
-                current_downsample = downsample_factor
-                
-                if finer_downsample < current_downsample:
-                    # Finer level has higher resolution, need to downsample residual
-                    current_height = max(1, original_height // current_downsample)
-                    current_width = max(1, original_width // current_downsample)
-                    
-                    residual_target_downsampled_bchw = residual_target_finer.permute(0, 3, 1, 2)  # [1, 3, H_finer, W_finer]
-                    residual_target_downsampled_bchw = F.interpolate(
-                        residual_target_downsampled_bchw,
-                        size=(current_height, current_width),
-                        mode='bilinear',
-                        align_corners=False,
-                    )
-                    residual_target = residual_target_downsampled_bchw.permute(0, 2, 3, 1)  # [1, H, W, 3]
-                    del residual_target_downsampled_bchw
-
-                    finer_colors_downsampled = finer_colors.permute(0, 3, 1, 2)
-                    finer_colors_downsampled = F.interpolate(
-                        finer_colors_downsampled,
-                        size=(current_height, current_width),
-                        mode='bilinear',
-                        align_corners=False,
-                    )
-                    finer_colors_downsampled = finer_colors_downsampled.permute(0, 2, 3, 1)
-
-                else:
-                    # Same resolution (shouldn't happen, but handle gracefully)
-                    residual_target = residual_target_finer
-                    finer_colors_downsampled = finer_colors
-                
-                del finer_colors, finer_pixels_downsampled, residual_target_finer
-                torch.cuda.empty_cache()
-        
         # Render at target_level using render_at_level function
+        # Calculate target_level based on step (coarse-to-fine)
+        max_level = cfg.max_level if cfg.max_level is not None else 1
+        target_level = min(1 + step // cfg.level_interval, max_level)
+        
         colors, pixels_downsampled, alphas, info = self.render_at_level(
             target_level=target_level,
             pixels_gt=pixels,
@@ -1462,37 +915,11 @@ class Runner:
             info=info,
         )
 
-        # Multigrid residual equation: 
-        # residual_color = render_current - GT_current
-        # residual_finer = render_finer - GT_finer (at finer level)
-        # We want: residual_color ≈ residual_finer_downsampled (coarse residual should match fine residual)
-        # This means: (render_current - GT_current) ≈ (render_finer - GT_finer)_downsampled
-        # Note: If render_finer ≈ GT_finer, then residual_finer ≈ 0, and residual_error ≈ residual_color,
-        # which becomes equivalent to standard GT loss: ||render_current - GT_current||
-        if residual_target is not None:
-            # residual_target = GT_finer - render_finer (already computed and downsampled)
-            # residual_finer = render_finer - GT_finer = -(GT_finer - render_finer) = -residual_target
-            residual_color = colors - finer_colors_downsampled
-
-            residual_error = residual_color - residual_target
-
-            # residual_finer_downsampled = -residual_target  # [1, H, W, 3] (render_finer - GT_finer, downsampled)
-            
-            # Residual error: difference between current residual and finer residual
-            # If residual_finer ≈ 0 (render_finer ≈ GT_finer), this becomes standard loss
-            # residual_error = residual_color - residual_target  # [1, H, W, 3]
-            l1loss = F.l1_loss(residual_error, torch.zeros_like(residual_error))
-            ssimloss = 1.0 - fused_ssim(
-                residual_error.permute(0, 3, 1, 2), 
-                torch.zeros_like(residual_error.permute(0, 3, 1, 2)), 
-                padding="valid"
-            )
-        else:
-            # Standard loss: render should match GT (finest level)
-            l1loss = F.l1_loss(colors, pixels)
-            ssimloss = 1.0 - fused_ssim(
-                colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
-            )
+        # Standard loss: render should match GT
+        l1loss = F.l1_loss(colors, pixels)
+        ssimloss = 1.0 - fused_ssim(
+            colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2), padding="valid"
+        )
         
         loss = l1loss * (1.0 - cfg.ssim_lambda) + ssimloss * cfg.ssim_lambda
         
@@ -1652,12 +1079,7 @@ class Runner:
             optimizer.zero_grad(set_to_none=True)
 
         # Run post-backward steps after backward and optimizer
-        # During V-cycle, we only update state (accumulate gradients) but skip densification
-        # Densification will be performed after V-cycle completion to maintain consistency
         if isinstance(self.cfg.strategy, MultigridStrategy):
-            # Call step_post_backward to update state (accumulate gradients)
-            # step_post_backward only updates state, densification is deferred to post_cycle
-            # visible_mask is obtained from info["visible_mask"] inside step_post_backward
             self.cfg.strategy.step_post_backward(
                 params=self.splats,
                 optimizers=self.optimizers,
@@ -1666,7 +1088,8 @@ class Runner:
                 info=info,
                 packed=cfg.packed,
             )
-            # Note: Densification is deferred until after V-cycle completion (in post_cycle)
+            
+            # Note: Densification is deferred until refine_every step (in train loop)
         elif isinstance(self.cfg.strategy, DefaultStrategy):
             self.cfg.strategy.step_post_backward(
                 params=self.splats,
@@ -1747,277 +1170,202 @@ class Runner:
             persistent_workers=True,
             pin_memory=True,
         )
-
-        self.trainloader = trainloader
-
         trainloader_iter = iter(trainloader)
 
-        print(len(trainloader))
-
-        # V-cycle training: use config values for smoothing_steps and solving_steps
-        smoothing_steps = cfg.smoothing_steps
-        solving_steps = cfg.solving_steps
-        
-        # Training loop with V-cycles
+        # Training loop (coarse-to-fine)
         global_tic = time.time()
-        current_step = init_step
-        vcycle_idx = 0
-        
         pbar = tqdm.tqdm(range(init_step, max_steps))
-        
-        # self.save_visualization(-1)
-        while current_step < max_steps:
+        for step in pbar:
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
                     time.sleep(0.01)
                 self.viewer.lock.acquire()
                 tic = time.time()
 
-            # Check if we have any GSs left
-            if len(self.multigrid_gaussians.levels) == 0:
-                print(f"ERROR: All Gaussian Splats have been pruned at step {current_step}. Training cannot continue.")
-                raise RuntimeError(f"No Gaussian Splats remaining at step {current_step}")
-            
-            # Strategy max_level should always use cfg.max_level (not dynamic)
-            if isinstance(self.cfg.strategy, MultigridStrategy):
-                # Always use cfg.max_level for strategy
-                strategy_max_level = cfg.max_level if cfg.max_level is not None else self.cfg.strategy.max_level
-                if "max_level" in self.strategy_state:
-                    self.strategy_state["max_level"] = strategy_max_level
-            
+            try:
+                data = next(trainloader_iter)
+            except StopIteration:
+                trainloader_iter = iter(trainloader)
+                data = next(trainloader_iter)
 
-            # Get max_level for cycle based on cycle_type
-            # V-cycle uses actual max level in hierarchical structure
-            # inv-F cycle uses cfg.max_level for more regular training
-            if cfg.cycle_type == "vcycle":
-                # V-cycle: use actual max level from hierarchical structure
-                if len(self.multigrid_gaussians.levels) > 0:
-                    cycle_max_level = int(self.multigrid_gaussians.levels.max().item())
-                else:
-                    cycle_max_level = 1
-                
-                # V-cycle: finest -> 1 -> finest
-                cycle_coarsest_level = 1
-                current_step, losses = perform_vcycle(
-                    current_step=current_step,
-                    max_level=cycle_max_level,
-                    coarsest_level=cycle_coarsest_level,
-                    smoothing_steps=smoothing_steps,
-                    solving_steps=solving_steps,
-                    total_steps=max_steps,
-                    runner=self,
-                    trainloader_iter=trainloader_iter,
-                    schedulers=schedulers,
-                    cfg=cfg,
-                    pbar=pbar,
-                    vcycle_idx=vcycle_idx,
-                    global_tic=global_tic,
-                )
-            elif cfg.cycle_type == "inv_fcycle":
-                # inv-F cycle: use cfg.max_level for regular training
-                # Rasterization handles cases where actual max level < cfg.max_level
-                cycle_max_level = cfg.max_level if cfg.max_level is not None else 1
-                
-                # inv-F cycle: finest~1 -> finest~2 -> ... -> finest~finest
-                current_step, losses = perform_inv_fcycle(
-                    current_step=current_step,
-                    max_level=cycle_max_level,
-                    smoothing_steps=smoothing_steps,
-                    solving_steps=solving_steps,
-                    total_steps=max_steps,
-                    runner=self,
-                    trainloader_iter=trainloader_iter,
-                    schedulers=schedulers,
-                    cfg=cfg,
-                    pbar=pbar,
-                    cycle_idx=vcycle_idx,
-                    global_tic=global_tic,
-                )
-            else:
-                raise ValueError(f"Unknown cycle_type: {cfg.cycle_type}")
-            
-            # After cycle completion, perform densification if needed
-            # This ensures hierarchical structure remains consistent during cycle
-            if isinstance(self.cfg.strategy, MultigridStrategy):
-                # Get the last step in this cycle for reference
-                last_step_in_cycle = current_step - 1 if current_step > 0 else 0
-                
-                # Call post_cycle to perform densification based on cycle count
-                # For inv-F cycle, vcycle_idx represents the outer cycle (finest~1, finest~2, etc.)
-                # Each inner V-cycle within inv-F cycle should use the same cycle_idx
-                self.cfg.strategy.post_cycle(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    cycle=vcycle_idx,
-                    step=last_step_in_cycle,
-                )
-                
-                # Update hierarchical structure from strategy state
-                self.multigrid_gaussians.levels = self.strategy_state["levels"]
-                self.multigrid_gaussians.parent_indices = self.strategy_state["parent_indices"]
-                self.multigrid_gaussians.level_indices = self.strategy_state["level_indices"]
-            
-            # Save visualization at the end of each cycle (if interval matches)
-            # Use last_step_in_cycle for visualization step number
-            last_step_in_cycle = current_step - 1 if current_step > 0 else 0
-            if cfg.visualization_interval > 0 and vcycle_idx % cfg.visualization_interval == 0:
-                self.save_visualization(last_step_in_cycle)
-            
-            # Save hierarchy visualization at the end of each cycle (if interval matches)
-            if cfg.hierarchy_visualization_interval > 0 and vcycle_idx % cfg.hierarchy_visualization_interval == 0:
-                self.save_hierarchy_visualization(last_step_in_cycle)
-            
-            # Measure metrics at the end of each cycle (lightweight, no image saving)
-            if cfg.metric_interval_cycles > 0 and vcycle_idx % cfg.metric_interval_cycles == 0:
-                self.measure_metric(last_step_in_cycle, stage="val", global_tic=global_tic)
-            
-            # Eval (full evaluation with image saving) at the end of each cycle
-            if vcycle_idx in cfg.eval_cycles:
-                self.eval(last_step_in_cycle)
-            
-            # Run compression at the end of each cycle (if specified in eval_cycles)
-            if cfg.compression is not None and vcycle_idx in cfg.eval_cycles:
-                self.run_compression(step=last_step_in_cycle)
-            
-            # Calculate average loss for this cycle
-            avg_loss = np.mean(losses) if losses else 0.0
-            
-            # Progress bar is already updated inside perform_vcycle/perform_inv_fcycle, but ensure it's synced
-            if pbar.n < current_step:
-                pbar.update(current_step - pbar.n)
-            
-            # Update progress bar description
-            if isinstance(self.cfg.strategy, MultigridStrategy):
-                strategy_max_level = self.strategy_state.get("max_level", cfg.max_level)
-            else:
-                strategy_max_level = cfg.max_level
-            
-            cycle_type_str = "V-cycle" if cfg.cycle_type == "vcycle" else "inv-F-cycle"
-            if len(self.multigrid_gaussians.levels) > 0:
-                actual_max_level = int(self.multigrid_gaussians.levels.max().item())
-                desc = f"{cycle_type_str} {vcycle_idx}| strategy_max_level={strategy_max_level}| actual_max_level={actual_max_level}| loss={avg_loss:.3f}| step={current_step}/{max_steps}"
-            else:
-                desc = f"{cycle_type_str} {vcycle_idx}| strategy_max_level={strategy_max_level}| loss={avg_loss:.3f}| step={current_step}/{max_steps}"
+            camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
+            Ks = data["K"].to(device)  # [1, 3, 3]
+            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            num_train_rays_per_step = (
+                pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
+            )
+            image_ids = data["image_id"].to(device)
+            masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            if cfg.depth_loss:
+                points = data["points"].to(device)  # [1, M, 2]
+                depths_gt = data["depths"].to(device)  # [1, M]
+
+            # Calculate target_level based on step (coarse-to-fine)
+            max_level = cfg.max_level if cfg.max_level is not None else 1
+            target_level = min(1 + step // cfg.level_interval, max_level)
+
+            loss = self._train_step(
+                step=step,
+                data=data,
+                global_tic=global_tic,
+            )
+
+            desc = f"loss={loss:.3f}| level={target_level}| step={step}/{max_steps}"
             pbar.set_description(desc)
-            
-            # Handle eval, save, visualization, etc. for steps completed in this cycle
-            # Process each step that was completed in this cycle
-            steps_in_cycle = list(range(current_step - len(losses), current_step))
-            for step in steps_in_cycle:
-                if step >= max_steps:
-                    break
-                    
-                # Tensorboard logging
-                if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
-                    mem = torch.cuda.max_memory_allocated() / 1024**3
-                    # Use the loss from this step if available, otherwise use average
-                    step_loss = losses[step - (current_step - len(losses))] if step >= (current_step - len(losses)) else avg_loss
-                    self.writer.add_scalar("train/loss", step_loss, step)
-                    self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
-                    self.writer.add_scalar("train/mem", mem, step)
-                    if cfg.tb_save_image:
-                        # Get a sample image for visualization
-                        try:
-                            data = next(trainloader_iter)
-                        except StopIteration:
-                            trainloader_iter = iter(self.trainloader)
-                            data = next(trainloader_iter)
-                        # Render at max level for visualization
-                        camtoworlds = data["camtoworld"].to(device)
-                        Ks = data["K"].to(device)
-                        # Ensure batch dimension exists
-                        if camtoworlds.dim() == 2:
-                            camtoworlds = camtoworlds.unsqueeze(0)
-                        if Ks.dim() == 2:
-                            Ks = Ks.unsqueeze(0)
-                        image_data = data["image"].to(device) / 255.0
-                        if image_data.dim() == 3:
-                            image_data = image_data.unsqueeze(0)
-                        if image_data.shape[-1] == 4:
-                            pixels = image_data[..., :3]
-                        else:
-                            pixels = image_data
-                        height, width = pixels.shape[1:3]
-                        # image_id is int from dataset, convert to tensor
-                        if isinstance(data["image_id"], torch.Tensor):
-                            image_ids = data["image_id"].to(device)
-                        else:
-                            image_ids = torch.tensor(data["image_id"], device=device)
-                        masks = data["mask"].to(device) if "mask" in data else None
-                        backgrounds = None
-                        if cfg.white_background:
-                            backgrounds = torch.ones(1, 3, device=device)
-                        colors, _, _ = self.rasterize_splats(
-                            camtoworlds=camtoworlds,
-                            Ks=Ks,
-                            width=width,
-                            height=height,
-                            level=-1,
-                            sh_degree=min(step // cfg.sh_degree_interval, cfg.sh_degree),
-                            near_plane=cfg.near_plane,
-                            far_plane=cfg.far_plane,
-                            image_ids=image_ids,
-                            masks=masks,
-                            backgrounds=backgrounds,
-                        )
-                        canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
-                        canvas = canvas.reshape(-1, *canvas.shape[2:])
-                        self.writer.add_image("train/render", canvas, step)
-                    self.writer.flush()
-                
-                # Save checkpoint
-                if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
-                    mem = torch.cuda.max_memory_allocated() / 1024**3
-                    stats = {
-                        "mem": mem,
-                        "num_GS": len(self.splats["means"]),
-                    }
-                    print("Step: ", step, stats)
-                    with open(
-                        f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
-                        "w",
-                    ) as f:
-                        json.dump(stats, f)
-                    data = {"step": step, "splats": self.splats.state_dict()}
-                    # Also save hierarchical structure
-                    data["levels"] = self.multigrid_gaussians.levels.cpu()
-                    data["parent_indices"] = self.multigrid_gaussians.parent_indices.cpu()
-                    data["level_indices"] = {
-                        k: v for k, v in self.multigrid_gaussians.level_indices.items()
-                    }
-                    if cfg.pose_opt:
-                        if world_size > 1:
-                            data["pose_adjust"] = self.pose_adjust.module.state_dict()
-                        else:
-                            data["pose_adjust"] = self.pose_adjust.state_dict()
-                    if cfg.app_opt:
-                        if world_size > 1:
-                            data["app_module"] = self.app_module.module.state_dict()
-                        else:
-                            data["app_module"] = self.app_module.state_dict()
-                    torch.save(
-                        data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
+
+            # Only increment scheduler if not past max_steps
+            if step < max_steps:
+                for scheduler in schedulers:
+                    scheduler.step()
+
+            # Tensorboard logging
+            if world_rank == 0 and cfg.tb_every > 0 and step % cfg.tb_every == 0:
+                mem = torch.cuda.max_memory_allocated() / 1024**3
+                self.writer.add_scalar("train/loss", loss, step)
+                self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
+                self.writer.add_scalar("train/mem", mem, step)
+                self.writer.add_scalar("train/target_level", target_level, step)
+                if cfg.tb_save_image:
+                    # Get a sample image for visualization
+                    try:
+                        viz_data = next(trainloader_iter)
+                    except StopIteration:
+                        trainloader_iter = iter(trainloader)
+                        viz_data = next(trainloader_iter)
+                    # Render at max level for visualization
+                    camtoworlds = viz_data["camtoworld"].to(device)
+                    Ks = viz_data["K"].to(device)
+                    # Ensure batch dimension exists
+                    if camtoworlds.dim() == 2:
+                        camtoworlds = camtoworlds.unsqueeze(0)
+                    if Ks.dim() == 2:
+                        Ks = Ks.unsqueeze(0)
+                    image_data = viz_data["image"].to(device) / 255.0
+                    if image_data.dim() == 3:
+                        image_data = image_data.unsqueeze(0)
+                    if image_data.shape[-1] == 4:
+                        pixels = image_data[..., :3]
+                    else:
+                        pixels = image_data
+                    height, width = pixels.shape[1:3]
+                    # image_id is int from dataset, convert to tensor
+                    if isinstance(viz_data["image_id"], torch.Tensor):
+                        image_ids = viz_data["image_id"].to(device)
+                    else:
+                        image_ids = torch.tensor(viz_data["image_id"], device=device)
+                    masks = viz_data["mask"].to(device) if "mask" in viz_data else None
+                    backgrounds = None
+                    if cfg.white_background:
+                        backgrounds = torch.ones(1, 3, device=device)
+                    colors, _, _ = self.rasterize_splats(
+                        camtoworlds=camtoworlds,
+                        Ks=Ks,
+                        width=width,
+                        height=height,
+                        level=-1,
+                        sh_degree=min(step // cfg.sh_degree_interval, cfg.sh_degree),
+                        near_plane=cfg.near_plane,
+                        far_plane=cfg.far_plane,
+                        image_ids=image_ids,
+                        masks=masks,
+                        backgrounds=backgrounds,
                     )
-                
-                # Skip PLY export for multigrid - export_splats doesn't save hierarchical structure
-                # Use save_multigrid_checkpoint instead to preserve full hierarchical information
-                # PLY export is disabled because it doesn't include parent_indices, levels, etc.
-            
-            vcycle_idx += 1
-            
+                    canvas = torch.cat([pixels, colors], dim=2).detach().cpu().numpy()
+                    canvas = canvas.reshape(-1, *canvas.shape[2:])
+                    self.writer.add_image("train/render", canvas, step)
+                self.writer.flush()
+
+            # Save checkpoint
+            if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
+                mem = torch.cuda.max_memory_allocated() / 1024**3
+                stats = {
+                    "mem": mem,
+                    "num_GS": len(self.splats["means"]),
+                }
+                print("Step: ", step, stats)
+                with open(
+                    f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
+                    "w",
+                ) as f:
+                    json.dump(stats, f)
+                data = {"step": step, "splats": self.splats.state_dict()}
+                # Also save hierarchical structure
+                data["levels"] = self.multigrid_gaussians.levels.cpu()
+                data["parent_indices"] = self.multigrid_gaussians.parent_indices.cpu()
+                data["level_indices"] = {
+                    k: v for k, v in self.multigrid_gaussians.level_indices.items()
+                }
+                if cfg.pose_opt:
+                    if world_size > 1:
+                        data["pose_adjust"] = self.pose_adjust.module.state_dict()
+                    else:
+                        data["pose_adjust"] = self.pose_adjust.state_dict()
+                if cfg.app_opt:
+                    if world_size > 1:
+                        data["app_module"] = self.app_module.module.state_dict()
+                    else:
+                        data["app_module"] = self.app_module.state_dict()
+                torch.save(
+                    data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
+                )
+
+            # Measure metrics (lightweight, no image saving)
+            if cfg.metric_interval > 0 and step % cfg.metric_interval == 0:
+                self.measure_metric(step, stage="val", global_tic=global_tic)
+
+            # eval the full set
+            if step in [i - 1 for i in cfg.eval_steps]:
+                self.eval(step)
+                self.render_traj(step)
+
+            # Save visualization images
+            if cfg.visualization_interval > 0 and step % cfg.visualization_interval == 0:
+                self.save_visualization(step)
+
+            # Save hierarchy visualization
+            if cfg.hierarchy_visualization_interval > 0 and step % cfg.hierarchy_visualization_interval == 0:
+                self.save_hierarchy_visualization(step)
+
+            # Perform densification (post_cycle) every refine_every steps
+            # For coarse-to-fine training, refine_every steps = 1 cycle
+            # post_cycle uses cycle-based logic, so we pass cycle = step // refine_every
+            if isinstance(self.cfg.strategy, MultigridStrategy):
+                if step % cfg.refine_every == 0:
+                    # Call post_cycle to perform densification
+                    # cycle = step // refine_every means: every refine_every steps = 1 cycle
+                    # post_cycle will check: cycle % self.refine_every != 0
+                    # Since we call it every refine_every steps, cycle increments by 1 each time
+                    # So cycle % self.refine_every will be 0, 1, 2, ... (if refine_every=1, always 0)
+                    # For refine_every=1: every step is a new cycle, so cycle % 1 == 0 always
+                    self.cfg.strategy.post_cycle(
+                        params=self.splats,
+                        optimizers=self.optimizers,
+                        state=self.strategy_state,
+                        cycle=step // cfg.refine_every,  # 1 cycle = refine_every steps
+                        step=step,
+                    )
+                    
+                    # Update hierarchical structure from strategy state
+                    self.multigrid_gaussians.levels = self.strategy_state["levels"]
+                    self.multigrid_gaussians.parent_indices = self.strategy_state["parent_indices"]
+                    self.multigrid_gaussians.level_indices = self.strategy_state["level_indices"]
+
+            # run compression
+            if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
+                self.run_compression(step=step)
+
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
                 num_train_steps_per_sec = 1.0 / (max(time.time() - tic, 1e-10))
+                num_train_rays_per_sec = (
+                    num_train_rays_per_step * num_train_steps_per_sec
+                )
                 # Update the viewer state.
-                self.viewer.render_tab_state.num_train_rays_per_sec = num_train_steps_per_sec
+                self.viewer.render_tab_state.num_train_rays_per_sec = (
+                    num_train_rays_per_sec
+                )
                 # Update the scene.
-                self.viewer.update(current_step, 0)
-            
-            if current_step >= max_steps:
-                # Don't run final V-cycle if we've already exceeded max_steps
-                # The current V-cycle should have been stopped at max_steps
-                break
+                self.viewer.update(step, num_train_rays_per_step)
         
         pbar.close()
         
@@ -2032,9 +1380,11 @@ class Runner:
             # Save multigrid checkpoint
             final_checkpoint_dir = f"{cfg.result_dir}/final_checkpoint"
             os.makedirs(final_checkpoint_dir, exist_ok=True)
+            # Use max_steps - 1 as the final step (since step goes from 0 to max_steps - 1)
+            final_step = max_steps - 1
             save_multigrid_checkpoint(
                 multigrid_gaussians=self.multigrid_gaussians,
-                step=current_step,
+                step=final_step,
                 save_dir=final_checkpoint_dir,
                 sh_degree=cfg.sh_degree,
             )
@@ -2044,7 +1394,7 @@ class Runner:
             save_level_pointclouds(
                 multigrid_gaussians=self.multigrid_gaussians,
                 save_dir=pointcloud_dir,
-                step=current_step,
+                step=final_step,
             )
             
             print("="*60)
@@ -2055,7 +1405,7 @@ class Runner:
     def measure_metric(self, step: int, stage: str = "val", global_tic = None) -> Dict[str, float]:
         """Measure metrics only (no image saving).
         
-        Renders at finest level and computes PSNR, SSIM, LPIPS metrics.
+        Renders at current training level (coarse-to-fine) and computes PSNR, SSIM, LPIPS metrics.
         This is a lightweight function for frequent metric measurement during training.
         
         Args:
@@ -2069,6 +1419,13 @@ class Runner:
         device = self.device
         world_rank = self.world_rank
         world_size = self.world_size
+
+        # Calculate target_level based on step (coarse-to-fine)
+        max_level = cfg.max_level if cfg.max_level is not None else 1
+        target_level = min(1 + step // cfg.level_interval, max_level)
+        
+        # Get max_level for image multigrid downsample
+        image_multigrid_max_level = cfg.max_level if cfg.max_level is not None else 1
 
         valloader = torch.utils.data.DataLoader(
             self.valset, batch_size=1, shuffle=False, num_workers=1
@@ -2095,37 +1452,46 @@ class Runner:
             
             # Handle RGBA images: extract RGB and alpha separately
             if image_data.shape[-1] == 4:
-                pixels = image_data[..., :3]  # [1, H, W, 3]
+                pixels_gt = image_data[..., :3]  # [1, H, W, 3]
             else:
-                pixels = image_data  # [1, H, W, 3]
+                pixels_gt = image_data  # [1, H, W, 3]
             
-            height, width = pixels.shape[1:3]
+            # Store original dimensions before any downsampling
+            original_height, original_width = pixels_gt.shape[1:3]
+            
+            # Store original Ks before any downsampling
+            Ks_original = data["K"].to(device)  # [3, 3] or [1, 3, 3]
+            if Ks_original.dim() == 2:
+                Ks_original = Ks_original.unsqueeze(0)  # [3, 3] -> [1, 3, 3]
 
             torch.cuda.synchronize()
             tic = time.time()
             
-            # Prepare backgrounds if needed
-            backgrounds = None
-            if cfg.white_background:
-                backgrounds = torch.ones(1, 3, device=device)  # [C=1, 3] for white background
-            
-            # Render at highest LOD for metrics (finest level)
-            colors, alphas, _ = self.multigrid_gaussians.rasterize_splats(
+            # Render at current training level using render_at_level
+            colors, pixels_downsampled, alphas, _ = self.render_at_level(
+                target_level=target_level,
+                pixels_gt=pixels_gt,
+                original_height=original_height,
+                original_width=original_width,
                 camtoworlds=camtoworlds,
-                Ks=Ks,
-                width=width,
-                height=height,
-                level=-1,  # Highest LOD for metrics (finest level)
+                Ks_original=Ks_original,
+                image_multigrid_max_level=image_multigrid_max_level,
                 sh_degree=cfg.sh_degree,
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
+                image_ids=torch.tensor(data["image_id"], device=device) if not isinstance(data["image_id"], torch.Tensor) else data["image_id"].to(device),
                 masks=masks,
-                packed=cfg.packed,
-                sparse_grad=cfg.sparse_grad,
-                distributed=world_size > 1,
-                camera_model=cfg.camera_model,
-                backgrounds=backgrounds,
-            )  # colors: [1, H, W, 3], alphas: [1, H, W, 1]
+                render_mode="RGB",
+            )
+            
+            # Use downsampled pixels for metric calculation
+            pixels = pixels_downsampled
+            
+            # Apply background if needed (similar to _train_step)
+            if cfg.random_bkgd or cfg.white_background:
+                backgrounds = torch.ones(1, 3, device=device) if cfg.white_background else torch.rand(1, 3, device=device)
+                colors = colors + backgrounds * (1.0 - alphas)
+            
             torch.cuda.synchronize()
             ellipse_time += max(time.time() - tic, 1e-10)
 
@@ -2151,11 +1517,10 @@ class Runner:
             
             stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
             
-            # Calculate finest level num_GS (rendered GS count) for direct comparison with baseline
-            # This counts only the gaussians that are actually rendered at the finest level
+            # Calculate target level num_GS (rendered GS count at current training level)
+            # For coarse-to-fine training, num_GS_finest represents the number of gaussians rendered at the current target level
             if len(self.multigrid_gaussians.levels) > 0:
-                highest_level = int(self.multigrid_gaussians.levels.max().item())
-                self.multigrid_gaussians.set_visible_mask(highest_level)
+                self.multigrid_gaussians.set_visible_mask(target_level)
                 num_GS_finest = self.multigrid_gaussians.visible_mask.sum().item()
             else:
                 num_GS_finest = len(self.splats["means"])
@@ -2699,7 +2064,19 @@ class Runner:
             )  # [1, H, W, 4]
             colors = torch.clamp(renders[..., 0:3], 0.0, 1.0)  # [1, H, W, 3]
             depths = renders[..., 3:4]  # [1, H, W, 1]
-            depths = (depths - depths.min()) / (depths.max() - depths.min())
+            # Normalize depths safely (handle empty or constant depth values)
+            if depths.numel() > 0:
+                depth_min = depths.min()
+                depth_max = depths.max()
+                depth_range = depth_max - depth_min
+                if depth_range > 1e-8:  # Avoid division by zero
+                    depths = (depths - depth_min) / depth_range
+                else:
+                    # If all depths are the same, set to zero
+                    depths = torch.zeros_like(depths)
+            else:
+                # If depths is empty, set to zero
+                depths = torch.zeros_like(depths)
             canvas_list = [colors, depths.repeat(1, 1, 1, 3)]
 
             # write images
@@ -2842,10 +2219,10 @@ if __name__ == "__main__":
 
     ```bash
     # Single GPU training
-    CUDA_VISIBLE_DEVICES=9 python vcycle_trainer.py --dataset_type nerf --data_dir /path/to/data
+    CUDA_VISIBLE_DEVICES=9 python coarse_to_fine_trainer.py --dataset_type nerf --data_dir /path/to/data
 
     # Distributed training on 4 GPUs: Effectively 4x batch size so run 4x less steps.
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python vcycle_trainer.py --dataset_type nerf --data_dir /path/to/data --steps_scaler 0.25
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python coarse_to_fine_trainer.py --dataset_type nerf --data_dir /path/to/data --steps_scaler 0.25
 
     ```
     """
