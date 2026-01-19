@@ -26,7 +26,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from datasets.colmap import Dataset as ColmapDataset, Parser as ColmapParser
 from datasets.nerf import Dataset as NerfDataset, Parser as NerfParser
-from multigrid_gaussians import MultigridGaussians
+from multigrid_gaussians_v9 import MultigridGaussians
 
 
 def load_multigrid_from_checkpoint(
