@@ -100,10 +100,10 @@ def get_result_directories() -> Dict[str, Optional[str]]:
     # Return found directories
     result = {}
     
-    result['simple'] = "/Bean/log/gwangjin/2025/gsplat/baseline/garden_type_colmap_factor_8"
+    result['simple'] = "./results/simple_trainer_original/bonsai_type_colmap_factor_4"
     # result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_norm"
     # result['vcycle2'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_norm_2"
-    result['simple_c2f'] = "/Bean/log/gwangjin/2025/gsplat/baseline_c2f/garden_type_colmap_factor_8/"
+    result['simple_c2f'] = "./results/simple_trainer_c2f/bonsai_type_colmap_factor_4/"
     # result['vc_v2'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_v2"
     # result['vc_v3'] = "/Bean/log/gwangjin/2025/gsplat/vcycle/garden_type_colmap_factor_8_vcycle_v3"
     # result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_vcycle/garden_type_colmap_factor_8_v1"
@@ -112,10 +112,11 @@ def get_result_directories() -> Dict[str, Optional[str]]:
     # result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/multigrid_vcycle/garden_type_colmap_factor_8_v14_randbkgd"
     # result['c2f'] = "/Bean/log/gwangjin/2025/gsplat/coarse_to_fine/garden_type_colmap_factor_8_coarse_to_fine"
     # result['c2f2'] = "/Bean/log/gwangjin/2025/gsplat/coarse_to_fine/garden_type_colmap_factor_8_coarse_to_fine_v3"
-    result['c2f_v3'] = "/Bean/log/gwangjin/2025/gsplat/coarse_to_fine_v3/garden_type_colmap_factor_8_coarse_to_fine_v2/"
+    # result['c2f_v3'] = "/Bean/log/gwangjin/2025/gsplat/coarse_to_fine_v3/garden_type_colmap_factor_8_coarse_to_fine_v2/"
 # 
     # result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/vcycle_trainer_v12_vcycle/garden_type_colmap_factor_8_v12_v2/"
-    result['vcycle'] = "/Bean/log/gwangjin/2025/gsplat/vcycle_trainer_v14_vcycle/garden_type_colmap_factor_8_v14_v1/"
+    result['vcycle'] = "./results/vcycle_trainer_v15_vcycle/bonsai_type_colmap_factor_4_v15_v10"
+    result['vcycle2'] = "./results/vcycle_trainer_v16_vcycle/bonsai_type_colmap_factor_4_v16_v1"
     # result['inv_fcycle'] = "/Bean/log/gwangjin/2025/gsplat/vcycle_trainer_v13_inv_fcycle/garden_type_colmap_factor_8_v13_v1/"
     # if vcycle_dir:
     #     result['vcycle'] = vcycle_dir
@@ -311,6 +312,8 @@ def main():
     print("\nSearching for result directories...")
     found_dirs = []
     for name, dir_path in result_dirs.items():
+        # print(dir_path)
+        # print(os.path.list)
         if dir_path and os.path.exists(dir_path):
             print(f"  Found {name}: {dir_path}")
             found_dirs.append((name, dir_path))
@@ -330,7 +333,7 @@ def main():
         metrics = parse_stats_files(Path(dir_path))
         if metrics:
             all_data[name] = metrics
-            print(metrics)
+            # print(metrics)
             print(f"    Found metrics: {list(metrics.keys())}")
             for metric_name, metric_data in metrics.items():
                 print(f"      {metric_name}: {len(metric_data)} data points")

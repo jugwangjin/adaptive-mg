@@ -212,9 +212,9 @@ class Config:
         
         if self.data_dir is None:
             if self.dataset_type == "colmap":
-                self.data_dir = "data/360_v2/garden"
+                self.data_dir = "./dataset/60_v2/garden"
             elif self.dataset_type == "nerf":
-                self.data_dir = "data/nerf/lego"
+                self.data_dir = "/Bean/data/gwangjin/2025/3dgs/lego"
             else:
                 raise ValueError(f"Unknown dataset_type: {self.dataset_type}")
         
@@ -236,7 +236,7 @@ class Config:
             settings_parts.append(f"patch_{self.patch_size}")
         
         settings_str = "_".join(settings_parts)
-        self.result_dir = f"/Bean/log/gwangjin/2025/gsplat/baseline_c2f/{dataset_name}_{settings_str}"
+        self.result_dir = f"./results/simple_trainer_c2f/{dataset_name}_{settings_str}"
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]

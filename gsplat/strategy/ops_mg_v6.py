@@ -129,39 +129,9 @@ def duplicate(
     sel_levels = levels[sel]
     sel_parents = parent_indices[sel]
 
-    # Energy-conserving opacity for duplicated gaussians (two copies)
-    multigrid_gaussians = state.get("multigrid_gaussians", None)
-    new_opacity_residuals = None
-    if multigrid_gaussians is not None and sel.numel() > 0:
-        with torch.no_grad():
-            actual_splats = multigrid_gaussians.get_splats(
-                level=None, detach_parents=False, current_splats=None
-            )
-            actual_logits = actual_splats["opacities"][sel]
-            actual_alpha = torch.sigmoid(actual_logits)
-            # Each copy should satisfy: 1 - (1 - a')^2 = a
-            target_alpha = 1.0 - torch.sqrt((1.0 - actual_alpha).clamp_min(1e-6))
-            target_alpha = target_alpha.clamp(1e-6, 1.0 - 1e-6)
-            target_logits = torch.logit(target_alpha)
-
-            parent_logits = torch.zeros_like(target_logits)
-            valid_parent_mask = (sel_parents >= 0) & (sel_parents < len(parent_indices))
-            if valid_parent_mask.any():
-                parent_logits[valid_parent_mask] = actual_splats["opacities"][
-                    sel_parents[valid_parent_mask]
-                ]
-            new_opacity_residuals = target_logits - parent_logits
-            del actual_splats, actual_logits, actual_alpha, target_alpha, target_logits, parent_logits
-
     def param_fn(name: str, p: Tensor) -> Tensor:
-        if name == "opacities" and new_opacity_residuals is not None:
-            # Apply energy-conserving opacity to both original and duplicated gaussians
-            p_updated = p.clone()
-            p_updated[sel] = new_opacity_residuals
-            p_new = torch.cat([p_updated, new_opacity_residuals])
-        else:
-            # Other parameters: copy as is
-            p_new = torch.cat([p, p[sel]])
+        # Vanilla-style duplicate: copy parameters as-is (matches ops.py)
+        p_new = torch.cat([p, p[sel]])
         return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
 
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
@@ -235,92 +205,79 @@ def split(
     sel_levels = levels[sel]
     sel_parents = parent_indices[sel]
 
-    rest = torch.where(~mask)[0]
     N_old = len(levels)
-
-    # Find children of selected gaussians that are parents (vectorized)
-    # For each sel[i], find all gaussians where parent_indices == sel[i]
-    # Using torch.isin for memory efficiency: O(N_old) memory instead of O(N_old * M)
-    valid_parent_mask = (parent_indices >= 0) & (parent_indices < N_old)
-    
-    if sel.numel() > 0:
-        # Check if parent_indices[i] is in sel
-        in_sel = torch.isin(parent_indices, sel)  # [N_old] bool
-        children_mask = in_sel & valid_parent_mask
-    else:
-        children_mask = torch.zeros(N_old, dtype=torch.bool, device=device)
-    
-    # Get indices of children
-    children_indices = torch.where(children_mask)[0]  # [M,] - indices of children
-
-    splats = state["multigrid_gaussians"].get_splats(level=None, detach_parents=False, current_splats=None)
-    scales = torch.exp(splats["scales"][sel])
-
-    quats = splats["quats"][sel]
-    
-    rotmats = normalized_quat_to_rotmat(quats)  # [N, 3, 3]
-    samples = torch.einsum(
-        "nij,nj,bnj->bni", 
-        rotmats, 
-        scales, 
-        torch.randn(2, len(scales), 3, device=device),
-    ) * 0.01 # [1, N, 3]
-
-    del splats
-
-    # Energy-conserving opacity for split gaussians (two copies)
     multigrid_gaussians = state.get("multigrid_gaussians", None)
+    mean_residuals = None
     new_opacity_residuals = None
     if multigrid_gaussians is not None and sel.numel() > 0:
         with torch.no_grad():
             actual_splats = multigrid_gaussians.get_splats(
                 level=None, detach_parents=False, current_splats=None
             )
-            actual_logits = actual_splats["opacities"][sel]
-            actual_alpha = torch.sigmoid(actual_logits)
-            # Each copy should satisfy: 1 - (1 - a')^2 = a
-            target_alpha = 1.0 - torch.sqrt((1.0 - actual_alpha).clamp_min(1e-6))
-            target_alpha = target_alpha.clamp(1e-6, 1.0 - 1e-6)
-            target_logits = torch.logit(target_alpha)
+            actual_means = actual_splats["means"][sel]
+            actual_scales = torch.exp(actual_splats["scales"][sel])
+            actual_quats = actual_splats["quats"][sel]
+            rotmats = normalized_quat_to_rotmat(actual_quats)  # [N, 3, 3]
+            samples = torch.einsum(
+                "nij,nj,bnj->bni",
+                rotmats,
+                actual_scales,
+                torch.randn(2, len(actual_scales), 3, device=device),
+            ) * 0.01  # [2, N, 3]
 
-            parent_logits = torch.zeros_like(target_logits)
+            parent_means = torch.zeros_like(actual_means)
             valid_parent_mask = (sel_parents >= 0) & (sel_parents < len(parent_indices))
             if valid_parent_mask.any():
-                parent_logits[valid_parent_mask] = actual_splats["opacities"][
+                parent_means[valid_parent_mask] = actual_splats["means"][
                     sel_parents[valid_parent_mask]
                 ]
-            new_opacity_residuals = target_logits - parent_logits
-            del actual_splats, actual_logits, actual_alpha, target_alpha, target_logits, parent_logits
+
+            scale_factor = multigrid_gaussians.position_scale_reduction ** (
+                sel_levels.float() - 1.0
+            )
+            scale_factor = scale_factor.unsqueeze(-1)
+            mean_residuals = (actual_means.unsqueeze(0) + samples - parent_means.unsqueeze(0)) / scale_factor.unsqueeze(0)
+
+            if revised_opacity:
+                actual_logits = actual_splats["opacities"][sel]
+                actual_alpha = torch.sigmoid(actual_logits)
+                target_alpha = 1.0 - torch.sqrt(
+                    (1.0 - actual_alpha).clamp_min(1e-6)
+                )
+                target_alpha = target_alpha.clamp(1e-6, 1.0 - 1e-6)
+                target_logits = torch.logit(target_alpha)
+                parent_logits = torch.zeros_like(target_logits)
+                if valid_parent_mask.any():
+                    parent_logits[valid_parent_mask] = actual_splats["opacities"][
+                        sel_parents[valid_parent_mask]
+                    ]
+                new_opacity_residuals = target_logits - parent_logits
+                del actual_logits, actual_alpha, target_alpha, target_logits, parent_logits
+
+            del actual_splats, actual_means, actual_scales, actual_quats, parent_means, scale_factor
 
     def param_fn(name: str, p: Tensor) -> Tensor:
         if name == "means":
-            p_split = (p[sel] + samples[1]).reshape(-1, 3)  # [2N, 3]
-            # p[sel] += samples[1]
-            # p[sel] += samples[1]
-        elif name == "scales":
-            # Scale adjustment for split:
-            # - Split 대상의 scale을 -log(1.6) (normal split behavior)
-            # - 만약 split 대상이 parent라면, 그 children들의 residual scale을 +log(1.6) 해서
-            #   children의 actual scale이 유지되도록 함
-            #   (children's actual_scale = parent_scale + child_residual)
-            #   parent_scale -= log(1.6)이면, child_residual += log(1.6) 해야 actual_scale 유지
-            
-            # Split 대상의 scale 감소
-            p[sel] = p[sel] - SPLIT_SCALE_LOG
-            
-            # Parent인 경우, children의 residual scale 증가 (actual scale 유지)
-            if len(children_indices) > 0:
-                p[children_indices] = p[children_indices] + SPLIT_SCALE_LOG
-            
+            if mean_residuals is not None:
+                p_updated = p.clone()
+                p_updated[sel] = mean_residuals[0]
+                p_split = mean_residuals[1]
+                p_new = torch.cat([p_updated, p_split])
+                return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
+            # Fallback: copy as-is if we cannot compute residual offsets
             p_split = p[sel]
-        elif name == "opacities" and new_opacity_residuals is not None:
-            # Apply energy-conserving opacity to both original and split gaussians
+        elif name == "scales":
+            p_updated = p.clone()
+            p_updated[sel] = p_updated[sel] - SPLIT_SCALE_LOG
+            p_split = p_updated[sel]
+            p_new = torch.cat([p_updated, p_split])
+            return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
+        elif name == "opacities" and revised_opacity and new_opacity_residuals is not None:
             p_updated = p.clone()
             p_updated[sel] = new_opacity_residuals
             p_split = new_opacity_residuals
             p_new = torch.cat([p_updated, p_split])
-            p_new = torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
-            return p_new
+            return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
         else:
             # Other parameters: same as duplicate (copy as is)
             p_split = p[sel]
@@ -935,136 +892,22 @@ def clone_hierarchy_block(
     sel_levels = levels[sel]
     sel_parents = parent_indices[sel]
     
-    # Determine which cloned gaussians need split-like scale adjustment
-    # is_small_mask is for original indices, need to map to sel indices
-    sel_is_small = None
-    if is_small_mask is not None:
-        sel_is_small = is_small_mask[sel]  # [len(sel),] - True for duplicate-like, False for split-like
-    
-    # Find children of cloned gaussians (for scale adjustment)
-    valid_parent_mask = (parent_indices >= 0) & (parent_indices < N_old)
-    if sel.numel() > 0:
-        in_sel = torch.isin(parent_indices, sel)
-        cloned_children_mask = in_sel & valid_parent_mask
-        cloned_children_indices = torch.where(cloned_children_mask)[0]
-    else:
-        cloned_children_indices = torch.empty(0, dtype=torch.long, device=device)
-
-    # Energy-conserving opacity for cloned gaussians (two copies)
+    # Compute actual parameters for original gaussians BEFORE cloning
+    # This preserves actual parameters when parent changes after cloning
     multigrid_gaussians = state.get("multigrid_gaussians", None)
-    new_opacity_residuals = None
+    original_actual_params = None
     if multigrid_gaussians is not None and sel.numel() > 0:
         with torch.no_grad():
-            actual_splats = multigrid_gaussians.get_splats(
+            original_actual_params = multigrid_gaussians.get_splats(
                 level=None, detach_parents=False, current_splats=None
             )
-            actual_logits = actual_splats["opacities"][sel]
-            actual_alpha = torch.sigmoid(actual_logits)
-            # Each copy should satisfy: 1 - (1 - a')^2 = a
-            target_alpha = 1.0 - torch.sqrt((1.0 - actual_alpha).clamp_min(1e-6))
-            target_alpha = target_alpha.clamp(1e-6, 1.0 - 1e-6)
-            target_logits = torch.logit(target_alpha)
-            
-            # Use updated parent logits when parent is also cloned to avoid double attenuation
-            parent_logits = torch.zeros_like(target_logits)
-            valid_parent_mask = (sel_parents >= 0) & (sel_parents < N_old)
-            if valid_parent_mask.any():
-                sel_mask = torch.zeros(N_old, dtype=torch.bool, device=device)
-                sel_mask[sel] = True
-                parent_in_sel = sel_mask[sel_parents[valid_parent_mask]]
-                parent_indices_valid = sel_parents[valid_parent_mask]
-                
-                if parent_in_sel.any():
-                    target_logits_full = torch.zeros(N_old, device=device, dtype=target_logits.dtype)
-                    target_logits_full[sel] = target_logits
-                    parent_logits[valid_parent_mask] = torch.where(
-                        parent_in_sel,
-                        target_logits_full[parent_indices_valid],
-                        actual_splats["opacities"][parent_indices_valid],
-                    )
-                else:
-                    parent_logits[valid_parent_mask] = actual_splats["opacities"][
-                        parent_indices_valid
-                    ]
-            new_opacity_residuals = target_logits - parent_logits
-
-            # Compensate non-cloned children of cloned parents to keep their actual opacity unchanged
-            opacity_comp_indices = None
-            opacity_comp_values = None
-            sel_mask = torch.zeros(N_old, dtype=torch.bool, device=device)
-            sel_mask[sel] = True
-            valid_parent_mask_all = (parent_indices >= 0) & (parent_indices < N_old)
-            parent_in_sel_all = torch.zeros(N_old, dtype=torch.bool, device=device)
-            if valid_parent_mask_all.any():
-                parent_in_sel_all[valid_parent_mask_all] = sel_mask[
-                    parent_indices[valid_parent_mask_all]
-                ]
-            child_mask = (~sel_mask) & valid_parent_mask_all & parent_in_sel_all
-            if child_mask.any():
-                child_indices = torch.where(child_mask)[0]
-                delta_full = torch.zeros(
-                    N_old, device=device, dtype=target_logits.dtype
-                )
-                delta_full[sel] = target_logits - actual_logits
-                parent_delta = delta_full[parent_indices[child_indices]]
-                opacity_comp_indices = child_indices
-                opacity_comp_values = -parent_delta
-            del actual_splats, actual_logits, actual_alpha, target_alpha, target_logits, parent_logits
+            # Extract only selected gaussians' actual parameters
+            original_actual_params = {k: v[sel] for k, v in original_actual_params.items()}
     
     def param_fn(name: str, p: Tensor) -> Tensor:
-        if name == "scales" and is_small_mask is not None and sel_is_small is not None:
-            # Apply scale adjustment based on is_small_mask (similar to split operation)
-            # Clone된 gaussians의 scale을 조절
-            p_cloned = p[sel].clone()  # Clone할 scale
-            
-            # Split-like adjustment (is_small=False): scale 감소
-            split_mask = ~sel_is_small  # [len(sel),] - True for split-like cloned gaussians
-            if split_mask.any():
-                # Split-like: clone된 gaussians의 scale을 -log(1.6) 감소
-                p_cloned[split_mask] = p_cloned[split_mask] - SPLIT_SCALE_LOG
-                
-                # Clone된 children의 residual scale 증가 (actual scale 유지)
-                # Find which cloned gaussians are children of split-like cloned parents
-                # Vectorized: avoid Python loop
-                if len(cloned_children_indices) > 0:
-                    # Create mapping tensor instead of dict for vectorized lookup
-                    old_to_sel_tensor = torch.full((N_old,), -1, dtype=torch.long, device=device)
-                    old_to_sel_tensor[sel] = torch.arange(len(sel), device=device)
-                    
-                    # Get parent indices for cloned children
-                    cloned_children_parents = parent_indices[cloned_children_indices]  # [K,]
-                    
-                    # Check which cloned children have cloned parents
-                    cloned_parent_mask = (cloned_children_parents >= 0) & (cloned_children_parents < N_old)
-                    cloned_parent_sel_indices = old_to_sel_tensor[cloned_children_parents[cloned_parent_mask]]  # [K_valid,]
-                    valid_cloned_parent_mask = cloned_parent_sel_indices >= 0  # [K_valid,] - parent is also cloned
-                    
-                    if valid_cloned_parent_mask.any():
-                        # Get children sel indices
-                        cloned_children_sel_indices = old_to_sel_tensor[cloned_children_indices[cloned_parent_mask][valid_cloned_parent_mask]]  # [M,]
-                        valid_parent_sel_indices = cloned_parent_sel_indices[valid_cloned_parent_mask]  # [M,]
-                        
-                        # Check if parents are split-like
-                        parent_split_mask = split_mask[valid_parent_sel_indices]  # [M,]
-                        if parent_split_mask.any():
-                            # Increase residual scale for children of split-like cloned parents
-                            children_to_adjust = cloned_children_sel_indices[parent_split_mask]
-                            p_cloned[children_to_adjust] = p_cloned[children_to_adjust] + SPLIT_SCALE_LOG
-            
-            # Duplicate-like (is_small=True): scale 조절 없음 (그대로 복사)
-            p_new = torch.cat([p, p_cloned])
-        elif name == "opacities" and new_opacity_residuals is not None:
-            # Apply energy-conserving opacity to both original and cloned gaussians
-            p_updated = p.clone()
-            p_updated[sel] = new_opacity_residuals
-            if opacity_comp_indices is not None:
-                p_updated[opacity_comp_indices] = (
-                    p_updated[opacity_comp_indices] + opacity_comp_values.to(p_updated.dtype)
-                )
-            p_new = torch.cat([p_updated, new_opacity_residuals])
-        else:
-            # Other parameters: clone as-is
-            p_new = torch.cat([p, p[sel]])
+        # Vanilla-style clone: copy parameters as-is (matches ops.py duplicate)
+        # Note: We'll adjust residuals after parent_indices are updated
+        p_new = torch.cat([p, p[sel]])
         return torch.nn.Parameter(p_new, requires_grad=p.requires_grad)
     
     def optimizer_fn(key: str, v: Tensor) -> Tensor:
@@ -1116,8 +959,69 @@ def clone_hierarchy_block(
     new_levels = torch.cat([levels, sel_levels])
     new_parent_indices = torch.cat([parent_indices, new_parent_indices_cloned])
     
-    # Update hierarchical structure
+    # Update hierarchical structure FIRST (needed for get_splats)
     _update_hierarchical_structure(state, new_levels, new_parent_indices)
+    
+    # Recompute residual parameters for cloned gaussians to preserve actual parameters
+    # This is necessary because cloned gaussians may have different parents
+    if original_actual_params is not None and multigrid_gaussians is not None:
+        with torch.no_grad():
+            # Get new parent actual parameters for cloned gaussians
+            new_actual_splats = multigrid_gaussians.get_splats(
+                level=None, detach_parents=False, current_splats=None
+            )
+            
+            # For each cloned gaussian, compute residual from new parent
+            for name in original_actual_params.keys():
+                if name not in params:
+                    continue
+                
+                cloned_actual = original_actual_params[name]  # [len(sel), ...]
+                cloned_levels = sel_levels  # [len(sel),]
+                cloned_parents = new_parent_indices_cloned  # [len(sel),]
+                
+                # Level 1: absolute parameters, no adjustment needed
+                level1_mask = (cloned_levels == 1)
+                if level1_mask.any():
+                    # Level 1: actual = residual, so just copy
+                    params[name].data[new_indices[level1_mask]] = cloned_actual[level1_mask]
+                
+                # Level 2+: residual = actual - parent_actual + offset
+                level2plus_mask = (cloned_levels > 1)
+                if level2plus_mask.any():
+                    level2plus_indices = new_indices[level2plus_mask]
+                    level2plus_parents = cloned_parents[level2plus_mask]
+                    valid_parent_mask = (level2plus_parents >= 0) & (level2plus_parents < N_new)
+                    
+                    if valid_parent_mask.any():
+                        valid_indices = level2plus_indices[valid_parent_mask]
+                        valid_parents = level2plus_parents[valid_parent_mask]
+                        valid_actual = cloned_actual[level2plus_mask][valid_parent_mask]
+                        parent_actual = new_actual_splats[name][valid_parents]
+                        
+                        if name == "means":
+                            # means: residual = (actual - parent_actual) / scale_factor
+                            valid_levels = cloned_levels[level2plus_mask][valid_parent_mask]
+                            scale_factor = multigrid_gaussians.position_scale_reduction ** (valid_levels.float() - 1)
+                            scale_factor = scale_factor.unsqueeze(-1) if valid_actual.dim() > 1 else scale_factor
+                            new_residual = (valid_actual - parent_actual) / scale_factor.clamp_min(1e-8)
+                            params[name].data[valid_indices] = new_residual
+                        elif name == "scales":
+                            # scales: residual = actual - parent_actual + CHILD_SCALE_LOG
+                            # CHILD_SCALE_LOG = log(1.6) = SPLIT_SCALE_LOG
+                            new_residual = valid_actual - parent_actual + SPLIT_SCALE_LOG
+                            params[name].data[valid_indices] = new_residual
+                        else:
+                            # opacities, sh0, shN, etc.: residual = actual - parent_actual
+                            new_residual = valid_actual - parent_actual
+                            params[name].data[valid_indices] = new_residual
+                    
+                    # Handle invalid parents (shouldn't happen, but safety check)
+                    invalid_parent_mask = ~valid_parent_mask
+                    if invalid_parent_mask.any():
+                        invalid_indices = level2plus_indices[invalid_parent_mask]
+                        # Set to zero residual (will become root-like)
+                        params[name].data[invalid_indices] = 0.0
     
     # Note: _add_zero_parameter_children is now called once after all grow operations
     # in _grow_gs to avoid redundant processing
@@ -1134,41 +1038,107 @@ def reset_opa_mg(
     optimizers: Dict[str, torch.optim.Optimizer],
     state: Dict[str, Tensor],
     value: float,
+    max_level: Optional[int] = None,
 ):
     """Inplace reset the opacities to the given post-sigmoid value (multigrid version).
     
     For multigrid_v6.py, opacities are residual parameters.
-    - Level 1: Reset to target value (absolute value)
-    - Level 2+: Reset to 0 (residual, so they inherit parent's opacity)
+    - Only resets opacities at the current max_level.
+    - Other levels maintain their current opacity values.
+    - If max_level is 1: Reset to target value (absolute value)
+    - If max_level > 1: Compute residual so that actual opacity equals target value.
+                       actual_opacity = parent_actual_opacity + child_residual
+                       child_residual = target_opacity - parent_actual_opacity
 
     Args:
         params: A dictionary of parameters.
         optimizers: A dictionary of optimizers, each corresponding to a parameter.
         state: State dictionary containing hierarchical structure (levels, parent_indices, level_indices).
-        value: The value to reset Level 1 opacities (post-sigmoid, e.g., 0.01).
+        value: The target opacity value (post-sigmoid, e.g., 0.01).
+        max_level: Maximum level in the hierarchy. If None, retrieved from state.
+                   Only gaussians at this level will be reset.
     """
     levels = state.get("levels", None)
     if levels is None:
         raise ValueError("levels not found in state. Cannot reset opacities by level.")
     
+    # Get max_level from state if not provided
+    if max_level is None:
+        max_level = state.get("max_level", None)
+        if max_level is None:
+            # Fallback: use maximum level in current structure
+            if len(levels) > 0:
+                max_level = int(levels.max().item())
+            else:
+                return  # No gaussians to reset
+    
+    max_level = int(max_level)
+    
+    # Only reset gaussians at max_level
+    max_level_mask = (levels == max_level)
+    if not max_level_mask.any():
+        return  # No gaussians at max_level to reset
+    
+    # Get multigrid_gaussians to compute actual opacities
+    multigrid_gaussians = state.get("multigrid_gaussians", None)
+    if multigrid_gaussians is None:
+        raise ValueError("multigrid_gaussians not found in state. Cannot compute actual opacities.")
+    
+    # Compute current actual opacities for max_level gaussians
+    with torch.no_grad():
+        actual_splats = multigrid_gaussians.get_splats(
+            level=None, detach_parents=False, current_splats=None
+        )
+        max_level_indices = torch.where(max_level_mask)[0]
+        current_actual_opacities = torch.sigmoid(actual_splats["opacities"][max_level_indices])
+        
+        # Target opacity in logit space
+        target_opacity = torch.tensor(value, device=params["opacities"].device, dtype=params["opacities"].dtype)
+        target_logit = torch.logit(target_opacity)
+        
+        if max_level == 1:
+            # Level 1: absolute parameter, reset directly to target
+            new_residuals = target_logit
+        else:
+            # Level 2+: residual parameter, compute residual to achieve target actual opacity
+            parent_indices = state.get("parent_indices", None)
+            if parent_indices is None:
+                raise ValueError("parent_indices not found in state.")
+            
+            max_level_parents = parent_indices[max_level_indices]
+            valid_parent_mask = (max_level_parents >= 0) & (max_level_parents < len(levels))
+            
+            if not valid_parent_mask.any():
+                # No valid parents, treat as level 1
+                new_residuals = target_logit
+            else:
+                # Get parent actual opacities
+                parent_actual_opacities = torch.sigmoid(actual_splats["opacities"][max_level_parents[valid_parent_mask]])
+                
+                # Compute residual: target_opacity = parent_actual_opacity + residual
+                # In logit space: logit(target) = logit(parent + residual)
+                # We need: sigmoid(parent_logit + residual) = target_opacity
+                # residual = logit(target_opacity) - parent_logit
+                parent_logits = actual_splats["opacities"][max_level_parents[valid_parent_mask]]
+                target_residuals = target_logit - parent_logits
+                
+                # Initialize with current residuals
+                new_residuals = params["opacities"].data[max_level_indices].clone()
+                new_residuals[valid_parent_mask] = target_residuals
+                
+                # For invalid parents, set to target (treat as level 1)
+                invalid_parent_mask = ~valid_parent_mask
+                if invalid_parent_mask.any():
+                    new_residuals[invalid_parent_mask] = target_logit
+        
+        del actual_splats, current_actual_opacities
+    
     def param_fn(name: str, p: Tensor) -> Tensor:
         if name == "opacities":
-            # Target value in logit space for Level 1
-            target_val = torch.logit(torch.tensor(value, device=p.device, dtype=p.dtype))
-            
             # Create new opacities tensor
             new_opacities = p.clone()
-            
-            # Level 1: Reset to target value (absolute value)
-            level1_mask = (levels == 1)
-            if level1_mask.any():
-                new_opacities[level1_mask] = torch.clamp(p[level1_mask], max=target_val)
-            
-            # Level 2+: Reset to 0 (residual, so they inherit parent's opacity)
-            level2plus_mask = (levels > 1)
-            if level2plus_mask.any():
-                new_opacities[level2plus_mask] = 0.0
-            
+            # Only update max_level gaussians
+            new_opacities[max_level_indices] = new_residuals
             return torch.nn.Parameter(new_opacities, requires_grad=p.requires_grad)
         else:
             raise ValueError(f"Unexpected parameter name: {name}")

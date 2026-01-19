@@ -208,9 +208,9 @@ class Config:
         
         if self.data_dir is None:
             if self.dataset_type == "colmap":
-                self.data_dir = "data/360_v2/garden"
+                self.data_dir = "./dataset/60_v2/garden"
             elif self.dataset_type == "nerf":
-                self.data_dir = "data/nerf/lego"
+                self.data_dir = "/Bean/data/gwangjin/2025/3dgs/lego"
             else:
                 raise ValueError(f"Unknown dataset_type: {self.dataset_type}")
         
@@ -232,7 +232,7 @@ class Config:
             settings_parts.append(f"patch_{self.patch_size}")
         
         settings_str = "_".join(settings_parts)
-        self.result_dir = f"/Bean/log/gwangjin/2025/gsplat/baseline/{dataset_name}_{settings_str}"
+        self.result_dir = f"./results/simple_trainer_original/{dataset_name}_{settings_str}"
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -578,21 +578,6 @@ class Runner:
         scales = torch.exp(self.splats["scales"])  # [N, 3]
         opacities = torch.sigmoid(self.splats["opacities"])  # [N,]
 
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        plt.figure()
-        plt.hist(opacities.cpu().data.numpy(), bins=100)
-        plt.savefig("opacities_simple.png")
-        plt.close()
-
-        #make histogram of scales
-        plt.figure()
-        plt.hist(scales.cpu().data.numpy(), bins=100)
-        plt.savefig("scales_simple.png")
-        plt.close()
-
-        exit()
 
         image_ids = kwargs.pop("image_ids", None)
         if self.cfg.app_opt:
@@ -710,6 +695,7 @@ class Runner:
                 trainloader_iter = iter(trainloader)
                 data = next(trainloader_iter)
 
+
             camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
             Ks = data["K"].to(device)  # [1, 3, 3]
             pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
@@ -746,6 +732,7 @@ class Runner:
                 render_mode="RGB+ED" if cfg.depth_loss else "RGB",
                 masks=masks,
             )
+
             if renders.shape[-1] == 4:
                 colors, depths = renders[..., 0:3], renders[..., 3:4]
             else:
