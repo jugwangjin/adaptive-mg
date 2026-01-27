@@ -351,7 +351,7 @@ class Config:
     pause_refine_after_level_increase: Optional[int] = None
     
     # Gradient scaling parameters
-    grad_scale_factor: float = 1.2 # Base factor for level-dependent gradient scaling
+    grad_scale_factor: float = 0.8 # Base factor for level-dependent gradient scaling
     # Gradient scale for level L: grad_scale_factor ** (max_level - L)
     # Coarse levels (low L) get larger scale, fine levels (high L) get smaller scale
     
@@ -1012,7 +1012,7 @@ def vcycle_recursive(
 
     # ========== Render-based Prolongation ==========
     # Applied after coarse solve (before upward smoothing)
-    if False and level > coarsest_level:
+    if level > coarsest_level:
         coarse_level = level - 1
         # Metric before prolongation
         log_level_metric(tag=f"UpPreProlong L{target_level}", print_metric=False)

@@ -46,6 +46,9 @@ opacity_grad_norms = []
 
 @dataclass
 class Config:
+    custom_train_json: str = None
+    # Path to COLMAP directory (for NeRF datasets, used instead of points_file)
+    colmap_dir: Optional[str] = None
     # Disable viewer
     disable_viewer: bool = True
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
@@ -106,9 +109,11 @@ class Config:
 
     # Initialization strategy
     init_type: str = "sfm"
-    # Initial number of GSs. Ignored if using sfm
+    # Path to PLY file for initialization (if provided, overrides init_type)
+    points_file: Optional[str] = None
+    # Initial number of GSs. Ignored if using sfm or points_file
     init_num_pts: int = 100_000
-    # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm
+    # Initial extent of GSs as a multiple of the camera extent. Ignored if using sfm or points_file
     init_extent: float = 3.0
     # Degree of spherical harmonics
     sh_degree: int = 3
@@ -258,6 +263,8 @@ class Config:
 def create_splats_with_optimizers(
     parser: Union[ColmapParser, NerfParser],
     init_type: str = "sfm",
+    points_file: Optional[str] = None,
+    colmap_dir: Optional[str] = None,
     init_num_pts: int = 100_000,
     init_extent: float = 3.0,
     init_opacity: float = 0.1,
@@ -278,49 +285,255 @@ def create_splats_with_optimizers(
     world_rank: int = 0,
     world_size: int = 1,
 ) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer]]:
-    if init_type == "sfm":
-        points = torch.from_numpy(parser.points).float()
-        rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
-    elif init_type == "random":
-        points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
-        rgbs = torch.rand((init_num_pts, 3))
+    # If colmap_dir is provided (for NeRF datasets), load from COLMAP using SceneManager
+    if colmap_dir is not None:
+        from pycolmap import SceneManager
+        import torch.nn.functional as F
+        from datasets.normalize import transform_points
+        
+        print(f"Loading initial points from COLMAP directory: {colmap_dir}")
+        manager = SceneManager(colmap_dir)
+        manager.load_points3D()
+        
+        # Extract points and colors from SceneManager
+        points = torch.from_numpy(manager.points3D.astype(np.float32))  # [N, 3]
+        points_rgb = torch.from_numpy(manager.point3D_colors.astype(np.float32) / 255.0)  # [N, 3] in [0, 1]
+
+        points_aligned_to_parser_world = False
+        if isinstance(parser, NerfParser):
+            # COLMAP points live in COLMAP world coordinates.
+            # NeRF `transform_matrix` often comes from COLMAP-to-NeRF converters
+            # (e.g., the GraphDECO script) that apply scene reorientation, recentering,
+            # and scaling. To align points with the NeRF cameras, estimate a similarity
+            # transform from COLMAP camera centers -> NeRF parser camera centers,
+            # and apply it to COLMAP points.
+
+            manager.load_cameras()
+            manager.load_images()
+
+            bottom = np.array([0, 0, 0, 1], dtype=np.float32).reshape(1, 4)
+
+            # name(stem) -> camera center in COLMAP world
+            colmap_centers: Dict[str, np.ndarray] = {}
+            for k in manager.images:
+                im = manager.images[k]
+                rot = im.R()
+                trans = im.tvec.reshape(3, 1)
+                w2c = np.concatenate([np.concatenate([rot, trans], 1), bottom], axis=0)
+                c2w = np.linalg.inv(w2c)
+                colmap_centers[Path(im.name).stem] = c2w[:3, 3].astype(np.float32)
+
+            # name(stem) -> camera center in NeRF parser world
+            nerf_centers: Dict[str, np.ndarray] = {}
+            for idx, img_path in enumerate(parser.image_paths):
+                nerf_centers[Path(img_path).stem] = parser.camtoworlds[idx][:3, 3].astype(
+                    np.float32
+                )
+
+            matched_colmap = []
+            matched_nerf = []
+            for name, c_nerf in nerf_centers.items():
+                if name in colmap_centers:
+                    matched_colmap.append(colmap_centers[name])
+                    matched_nerf.append(c_nerf)
+
+            if len(matched_colmap) >= 3:
+                X = np.stack(matched_colmap, axis=0).astype(np.float32)  # (M, 3)
+                Y = np.stack(matched_nerf, axis=0).astype(np.float32)  # (M, 3)
+
+                mu_X = X.mean(axis=0)
+                mu_Y = Y.mean(axis=0)
+                X0 = X - mu_X
+                Y0 = Y - mu_Y
+
+                cov = (Y0.T @ X0) / X.shape[0]
+                U, D, Vt = np.linalg.svd(cov)
+                S = np.eye(3, dtype=np.float32)
+                if np.linalg.det(U) * np.linalg.det(Vt) < 0:
+                    S[2, 2] = -1.0
+                R = (U @ S @ Vt).astype(np.float32)
+
+                var_X = float((X0**2).sum() / X.shape[0])
+                scale = float((D * np.diag(S)).sum() / var_X)
+                t = (mu_Y - scale * (R @ mu_X)).astype(np.float32)
+
+                points_np = points.cpu().numpy().astype(np.float32)
+                points_np = scale * (points_np @ R.T) + t[None, :]
+                points = torch.from_numpy(points_np).to(points.device)
+
+                X_hat = scale * (X @ R.T) + t[None, :]
+                rms = float(np.sqrt(np.mean(np.sum((X_hat - Y) ** 2, axis=1))))
+                print(
+                    f"[init points] aligned COLMAP->NeRF using {len(X)} pose matches | "
+                    f"scale={scale:.6f} rms={rms:.6f}"
+                )
+                points_aligned_to_parser_world = True
+            else:
+                print(
+                    f"[init points] only {len(matched_colmap)} pose matches between COLMAP and NeRF; "
+                    "skipping similarity alignment"
+                )
+
+        # Apply parser.transform if normalize was used (same as parser.points).
+        # If we already aligned points using camera centers, the transform is already baked in.
+        if (not points_aligned_to_parser_world) and hasattr(parser, "transform") and parser.transform is not None:
+            transform = parser.transform
+            if not isinstance(transform, np.ndarray):
+                transform = np.eye(4)  # fallback to identity
+            points_np = points.cpu().numpy()
+            points_np = transform_points(transform, points_np)
+            points = torch.from_numpy(points_np.astype(np.float32)).to(points.device)
+        
+        # Initialize scales based on KNN (similar to original initialization)
+        dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+        dist_avg = torch.sqrt(dist2_avg)
+        scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+        
+        # Initialize quaternions randomly
+        quats = torch.rand((len(points), 4))  # [N, 4]
+        quats = F.normalize(quats, p=2, dim=-1)
+        
+        # Initialize opacities
+        opacities = torch.logit(torch.full((len(points),), init_opacity))  # [N,]
+        
+        # Convert RGB to SH coefficients
+        sh0 = rgb_to_sh(points_rgb).unsqueeze(1)  # [N, 1, 3]
+        shN = torch.zeros((len(points), (sh_degree + 1) ** 2 - 1, 3))  # [N, K, 3]
+        
+        # Distribute the GSs to different ranks (also works for single rank)
+        points = points[world_rank::world_size]
+        scales = scales[world_rank::world_size]
+        quats = quats[world_rank::world_size]
+        opacities = opacities[world_rank::world_size]
+        sh0 = sh0[world_rank::world_size]
+        shN = shN[world_rank::world_size]
+        
+        N = points.shape[0]
+        
+        params = [
+            # name, value, lr
+            ("means", torch.nn.Parameter(points), means_lr * scene_scale),
+            ("scales", torch.nn.Parameter(scales), scales_lr),
+            ("quats", torch.nn.Parameter(quats), quats_lr),
+            ("opacities", torch.nn.Parameter(opacities), opacities_lr),
+        ]
+        
+        if feature_dim is None:
+            params.append(("sh0", torch.nn.Parameter(sh0), sh0_lr))
+            params.append(("shN", torch.nn.Parameter(shN), shN_lr))
+        else:
+            # features will be used for appearance and view-dependent shading
+            # Extract RGB from sh0 for color initialization
+            rgbs = sh0.squeeze(1)  # [N, 3] - approximate RGB from SH band 0
+            features = torch.rand(N, feature_dim, device=device)  # [N, feature_dim]
+            params.append(("features", torch.nn.Parameter(features), sh0_lr))
+            colors = torch.logit(torch.clamp(rgbs, 0.0, 1.0))  # [N, 3]
+            params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
+    # If points_file is provided, load from PLY file (overrides init_type)
+    elif points_file is not None:
+        from build_hierarchy import load_ply
+        print(f"Loading initial points from PLY file: {points_file}")
+        ply_data = load_ply(points_file)
+        
+        # Extract data from PLY
+        points = ply_data["means"]  # [N, 3]
+        scales = ply_data["scales"]  # [N, 3] (already in log space)
+        quats = ply_data["quats"]  # [N, 4]
+        opacities = ply_data["opacities"]  # [N] (already in logit space)
+        sh0 = ply_data["sh0"]  # [N, 1, 3]
+        shN = ply_data["shN"]  # [N, K, 3]
+        
+        # Normalize quaternions
+        quats = F.normalize(quats, p=2, dim=-1)
+        
+        # Distribute the GSs to different ranks (also works for single rank)
+        points = points[world_rank::world_size]
+        scales = scales[world_rank::world_size]
+        quats = quats[world_rank::world_size]
+        opacities = opacities[world_rank::world_size]
+        sh0 = sh0[world_rank::world_size]
+        shN = shN[world_rank::world_size]
+        
+        N = points.shape[0]
+        
+        params = [
+            # name, value, lr
+            ("means", torch.nn.Parameter(points), means_lr * scene_scale),
+            ("scales", torch.nn.Parameter(scales), scales_lr),
+            ("quats", torch.nn.Parameter(quats), quats_lr),
+            ("opacities", torch.nn.Parameter(opacities), opacities_lr),
+        ]
+        
+        if feature_dim is None:
+            # Use SH coefficients from PLY file
+            # Ensure sh0 and shN match the expected sh_degree
+            expected_sh_dims = (sh_degree + 1) ** 2
+            current_sh_dims = 1 + shN.shape[1]  # 1 (sh0) + K (shN)
+            
+            if current_sh_dims < expected_sh_dims:
+                # Pad shN with zeros if needed
+                pad_size = expected_sh_dims - current_sh_dims
+                shN_padded = torch.zeros(N, pad_size, 3, device=shN.device, dtype=shN.dtype)
+                shN = torch.cat([shN, shN_padded], dim=1)
+            elif current_sh_dims > expected_sh_dims:
+                # Truncate shN if needed
+                shN = shN[:, :(expected_sh_dims - 1), :]
+            
+            params.append(("sh0", torch.nn.Parameter(sh0), sh0_lr))
+            params.append(("shN", torch.nn.Parameter(shN), shN_lr))
+        else:
+            # features will be used for appearance and view-dependent shading
+            # Extract RGB from sh0 for color initialization
+            rgbs = sh0.squeeze(1)  # [N, 3] - approximate RGB from SH band 0
+            features = torch.rand(N, feature_dim, device=device)  # [N, feature_dim]
+            params.append(("features", torch.nn.Parameter(features), sh0_lr))
+            colors = torch.logit(torch.clamp(rgbs, 0.0, 1.0))  # [N, 3]
+            params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
     else:
-        raise ValueError("Please specify a correct init_type: sfm or random")
+        # Original initialization logic
+        if init_type == "sfm":
+            points = torch.from_numpy(parser.points).float()
+            rgbs = torch.from_numpy(parser.points_rgb / 255.0).float()
+        elif init_type == "random":
+            points = init_extent * scene_scale * (torch.rand((init_num_pts, 3)) * 2 - 1)
+            rgbs = torch.rand((init_num_pts, 3))
+        else:
+            raise ValueError("Please specify a correct init_type: sfm or random")
 
-    # Initialize the GS size to be the average dist of the 3 nearest neighbors
-    dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
-    dist_avg = torch.sqrt(dist2_avg)
-    scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
+        # Initialize the GS size to be the average dist of the 3 nearest neighbors
+        dist2_avg = (knn(points, 4)[:, 1:] ** 2).mean(dim=-1)  # [N,]
+        dist_avg = torch.sqrt(dist2_avg)
+        scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
-    # Distribute the GSs to different ranks (also works for single rank)
-    points = points[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
-    scales = scales[world_rank::world_size]
+        # Distribute the GSs to different ranks (also works for single rank)
+        points = points[world_rank::world_size]
+        rgbs = rgbs[world_rank::world_size]
+        scales = scales[world_rank::world_size]
 
-    N = points.shape[0]
-    quats = torch.rand((N, 4))  # [N, 4]
-    opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
+        N = points.shape[0]
+        quats = torch.rand((N, 4))  # [N, 4]
+        opacities = torch.logit(torch.full((N,), init_opacity))  # [N,]
 
-    params = [
-        # name, value, lr
-        ("means", torch.nn.Parameter(points), means_lr * scene_scale),
-        ("scales", torch.nn.Parameter(scales), scales_lr),
-        ("quats", torch.nn.Parameter(quats), quats_lr),
-        ("opacities", torch.nn.Parameter(opacities), opacities_lr),
-    ]
+        params = [
+            # name, value, lr
+            ("means", torch.nn.Parameter(points), means_lr * scene_scale),
+            ("scales", torch.nn.Parameter(scales), scales_lr),
+            ("quats", torch.nn.Parameter(quats), quats_lr),
+            ("opacities", torch.nn.Parameter(opacities), opacities_lr),
+        ]
 
-    if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
-    else:
-        # features will be used for appearance and view-dependent shading
-        features = torch.rand(N, feature_dim)  # [N, feature_dim]
-        params.append(("features", torch.nn.Parameter(features), sh0_lr))
-        colors = torch.logit(rgbs)  # [N, 3]
-        params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
+        if feature_dim is None:
+            # color is SH coefficients.
+            colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
+            colors[:, 0, :] = rgb_to_sh(rgbs)
+            params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
+            params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        else:
+            # features will be used for appearance and view-dependent shading
+            features = torch.rand(N, feature_dim)  # [N, feature_dim]
+            params.append(("features", torch.nn.Parameter(features), sh0_lr))
+            colors = torch.logit(rgbs)  # [N, 3]
+            params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
 
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     # Scale learning rate based on batch size, reference:
@@ -401,6 +614,7 @@ class Runner:
                 test_every=cfg.test_every,
                 white_background=cfg.white_background,
                 extension=cfg.image_extension,
+                custom_train_json=cfg.custom_train_json,
             )
             self.trainset = NerfDataset(
                 self.parser,
@@ -433,6 +647,8 @@ class Runner:
         self.splats, self.optimizers = create_splats_with_optimizers(
             self.parser,
             init_type=cfg.init_type,
+            points_file=cfg.points_file,
+            colmap_dir=cfg.colmap_dir if cfg.dataset_type == "nerf" else None,
             init_num_pts=cfg.init_num_pts,
             init_extent=cfg.init_extent,
             init_opacity=cfg.init_opa,

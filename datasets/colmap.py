@@ -7,7 +7,38 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 from PIL import Image
-from pycolmap import SceneManager
+
+# Fix for pycolmap: np.uint64(-1) fails in Python 3.11+ with newer numpy
+# scipy를 먼저 완전히 import한 후 패치 적용 (scipy가 np.uint64를 데이터 타입으로 사용)
+# pycolmap import 중에 scipy가 사용되므로 미리 import 필요
+try:
+    # scipy의 모든 필요한 모듈을 먼저 import하여 np.uint64를 데이터 타입으로 인식하게 함
+    # _lil을 import하면 _csparsetools도 함께 로드되므로, 패치 적용 전에 완전히 로드해야 함
+    import scipy
+    import scipy.optimize
+    import scipy.sparse
+    import scipy.sparse.linalg
+    # _lil을 import하면 _csparsetools도 함께 로드됨 (이 시점에 np.uint64는 원래 데이터 타입이어야 함)
+    import scipy.sparse._lil
+except ImportError:
+    pass  # scipy가 없어도 계속 진행
+
+# 패치 적용 (scipy는 이미 완전히 import되었으므로 np.uint64를 데이터 타입으로 인식함)
+_original_uint64 = np.uint64
+_max_uint64 = np.array([18446744073709551615], dtype=np.uint64)[0]  # 2^64 - 1
+
+def _patched_uint64(value):
+    if value == -1:
+        return _max_uint64
+    return _original_uint64(value)
+
+np.uint64 = _patched_uint64
+try:
+    from pycolmap import SceneManager
+finally:
+    # 패치 복원
+    np.uint64 = _original_uint64
+
 from tqdm import tqdm
 from typing_extensions import assert_never
 

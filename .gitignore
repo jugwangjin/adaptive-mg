@@ -1,3 +1,6 @@
+markdowns/
+*.png
+.cursor/
 dataset/
 comparison_graphs/
 reference_codes/

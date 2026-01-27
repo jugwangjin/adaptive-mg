@@ -66,6 +66,7 @@ class Parser:
         test_every: int = 8,
         white_background: bool = False,
         extension: str = ".png",
+        custom_train_json: Optional[str] = None,
     ):
         """
         Args:
@@ -75,6 +76,7 @@ class Parser:
             test_every: Every N images is a test image (if test split not explicitly defined)
             white_background: Whether to use white background for RGBA images
             extension: Image file extension (.png, .jpg, etc.)
+            custom_train_json: Optional path to custom training JSON file (if None, uses transforms_train.json)
         """
         self.data_dir = data_dir
         self.factor = factor
@@ -84,10 +86,21 @@ class Parser:
         self.extension = extension
 
         # Load training transforms
-        transforms_train_path = os.path.join(data_dir, "transforms_train.json")
+        if custom_train_json is not None:
+            # Use custom JSON file (can be absolute or relative path)
+            if os.path.isabs(custom_train_json):
+                transforms_train_path = custom_train_json
+            else:
+                # Relative path: resolve relative to data_dir
+                transforms_train_path = os.path.join(data_dir, custom_train_json)
+            print(f"Using custom training JSON: {transforms_train_path}")
+        else:
+            # Use default transforms_train.json
+            transforms_train_path = os.path.join(data_dir, "transforms_train.json")
+        
         if not os.path.exists(transforms_train_path):
             raise ValueError(
-                f"transforms_train.json not found at {transforms_train_path}"
+                f"Training JSON not found at {transforms_train_path}"
             )
 
         # Load test transforms (optional)
@@ -253,7 +266,7 @@ class Parser:
 
                 # NeRF 'transform_matrix' is a camera-to-world transform
                 c2w = np.array(frame["transform_matrix"]).astype(np.float32)
-                # Change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
+                # Change from OpenGL/Blender camera axes (Z up, Y back) to COLMAP (Y down, Z forward)
                 c2w[:3, 1:3] *= -1
 
                 # Load image to get dimensions

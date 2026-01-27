@@ -7,7 +7,7 @@ from torch import Tensor
 from typing_extensions import Literal
 
 from .base import Strategy
-from .ops_mg_v6 import clone_hierarchy_block, duplicate, remove_mg, reset_opa_mg, split, _add_zero_parameter_children
+from .ops_mg_v9 import clone_hierarchy_block, duplicate, remove_mg, reset_opa_mg, split, _add_zero_parameter_children
 
 
 @dataclass
@@ -74,7 +74,7 @@ class MultigridStrategy(Strategy):
     max_children_per_parent: int = 5  # Maximum number of children a parent can have
     max_level: int = 5  # Maximum level in the hierarchy
     use_gradient_inheritance: bool = True  # Enable gradient inheritance from parent to children
-    gradient_inheritance_factor: float = 0.25  # Factor by which to scale the gradient of the parent for the children
+    gradient_inheritance_factor: float = 0.5  # Factor by which to scale the gradient of the parent for the children
     grad_scale_factor: float = 1.0  # Level-wise gradient scaling (used for threshold scaling)
 
     def initialize_state(self, scene_scale: float = 1.0, levels: Tensor = None, parent_indices: Tensor = None, level_indices: Dict[int, List[int]] = None, max_level: Optional[int] = None, multigrid_gaussians: Optional[Any] = None) -> Dict[str, Any]:

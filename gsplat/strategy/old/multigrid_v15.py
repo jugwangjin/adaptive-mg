@@ -7,7 +7,7 @@ from torch import Tensor
 from typing_extensions import Literal
 
 from .base import Strategy
-from .ops_mg_v9 import clone_hierarchy_block, duplicate, remove_mg, reset_opa_mg, split, _add_zero_parameter_children
+from .ops_mg_v7 import clone_hierarchy_block, duplicate, remove_mg, reset_opa_mg, split, _add_zero_parameter_children
 
 
 @dataclass
@@ -74,7 +74,7 @@ class MultigridStrategy(Strategy):
     max_children_per_parent: int = 5  # Maximum number of children a parent can have
     max_level: int = 5  # Maximum level in the hierarchy
     use_gradient_inheritance: bool = True  # Enable gradient inheritance from parent to children
-    gradient_inheritance_factor: float = 0.5  # Factor by which to scale the gradient of the parent for the children
+    gradient_inheritance_factor: float = 0.25  # Factor by which to scale the gradient of the parent for the children
     grad_scale_factor: float = 1.0  # Level-wise gradient scaling (used for threshold scaling)
 
     def initialize_state(self, scene_scale: float = 1.0, levels: Tensor = None, parent_indices: Tensor = None, level_indices: Dict[int, List[int]] = None, max_level: Optional[int] = None, multigrid_gaussians: Optional[Any] = None) -> Dict[str, Any]:
@@ -391,8 +391,7 @@ class MultigridStrategy(Strategy):
                     state["parent_indices"] = multigrid_gaussians.parent_indices
                     state["level_indices"] = multigrid_gaussians.level_indices
 
-        # Final validation: ensure parent indices are in bounds after all operations
-        # This is a safety net - index updates should be correct in duplicate/split/clone_hierarchy_block
+        # Sanity check: ensure parent indices are in bounds after densification/prune
         levels = state["levels"]
         parent_indices = state["parent_indices"]
         N_final = len(levels)
@@ -412,7 +411,9 @@ class MultigridStrategy(Strategy):
                     multigrid_gaussians.parent_indices = parent_indices
                     multigrid_gaussians.level_indices = level_indices_new
                 if self.verbose:
-                    print(f"  Warning: fixed {invalid_parent_mask.sum().item()} out-of-bounds parent indices")
+                    print(
+                        f"  Sanity: reset {invalid_parent_mask.sum().item()} invalid parent indices"
+                    )
         
         # Reset opacities (cycle-based)
         if self.use_opacity_reset and cycle % self.reset_every == 0 and cycle > 0:

@@ -15,6 +15,7 @@ import tqdm
 import tyro
 import viser
 import yaml
+import faiss
 from datasets.colmap import Dataset as ColmapDataset, Parser as ColmapParser
 from datasets.nerf import Dataset as NerfDataset, Parser as NerfParser
 from datasets.traj import (
@@ -33,12 +34,15 @@ from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_rand
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
+from gsplat.cuda._wrapper import quat_scale_to_covar_preci
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
+from multigrid_gaussians_v8 import MultigridGaussians, quaternion_multiply
+# load_hierarchy_multigrid is now a static method of MultigridGaussians
 
 
 opacity_grad_norms = []
@@ -46,6 +50,9 @@ opacity_grad_norms = []
 
 @dataclass
 class Config:
+    # Hierarchy loading (required)
+    hierarchy_path: Optional[str] = None
+    
     # Disable viewer
     disable_viewer: bool = True
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
@@ -87,22 +94,22 @@ class Config:
     steps_scaler: float = 1.0
 
     # Number of training steps
-    max_steps: int = 30_000
+    max_steps: int = 10_000
     # Steps to evaluate the model
-    eval_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    eval_steps: List[int] = field(default_factory=lambda: [5_000, 10_000])
     # Interval for metric measurement (every N steps). -1 means disable metric measurement.
-    metric_interval: int = -1
+    metric_interval: int = 200
     # Steps to save the model
-    save_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    save_steps: List[int] = field(default_factory=lambda: [5_000, 10_000])
     # Whether to save ply file (storage size can be large)
-    save_ply: bool = True
+    save_ply: bool = False
     # Steps to save the model as ply
-    ply_steps: List[int] = field(default_factory=lambda: [7_000, 30_000])
+    ply_steps: List[int] = field(default_factory=lambda: [5_000, 10_000])
     # Whether to disable video generation during training and evaluation
     disable_video: bool = False
 
     # Visualization: interval to save visualization images (GT vs render)
-    visualization_interval: int = 200
+    visualization_interval: int = 100
 
     # Initialization strategy
     init_type: str = "sfm"
@@ -115,7 +122,7 @@ class Config:
     # Turn on another SH degree every this steps
     sh_degree_interval: int = 1000
     # Initial opacity of GS
-    init_opa: float = 0.1
+    init_opa: float = 0.9
     # Initial scale of GS
     init_scale: float = 1.0
     # Weight for SSIM loss
@@ -135,7 +142,7 @@ class Config:
     # Use sparse gradients for optimization. (experimental)
     sparse_grad: bool = False
     # Use visible adam from Taming 3DGS. (experimental)
-    visible_adam: bool = False
+    visible_adam: bool = True
     # Anti-aliasing in rasterization. Might slightly hurt quantitative metrics.
     antialiased: bool = False
 
@@ -202,6 +209,11 @@ class Config:
     # Whether use fused-bilateral grid
     use_fused_bilagrid: bool = False
 
+    # Use coarse-to-fine training (like simple_trainer_c2f.py)
+    use_coarse_to_fine: bool = False
+    # Coarse-to-fine: interval for switching to next level (every N steps)
+    level_interval: int = 1500
+
     def __post_init__(self):
         """Auto-generate result_dir if not provided."""
         from pathlib import Path
@@ -232,7 +244,15 @@ class Config:
             settings_parts.append(f"patch_{self.patch_size}")
         
         settings_str = "_".join(settings_parts)
-        self.result_dir = f"./results/simple_trainer_original/{dataset_name}_{settings_str}"
+        # hierarchy_path may be None during config initialization, will be validated later
+        if self.hierarchy_path is not None:
+            hierarchy_name = Path(self.hierarchy_path).stem
+            result_base = f"./results/hierarchy_trainer_simple/{dataset_name}_{settings_str}_hierarchy_{hierarchy_name}"
+        else:
+            result_base = f"./results/hierarchy_trainer_simple/{dataset_name}_{settings_str}_hierarchy_unknown"
+        if self.use_coarse_to_fine:
+            result_base += "_c2f"
+        self.result_dir = result_base
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -240,6 +260,8 @@ class Config:
         self.ply_steps = [int(i * factor) for i in self.ply_steps]
         self.max_steps = int(self.max_steps * factor)
         self.sh_degree_interval = int(self.sh_degree_interval * factor)
+        if self.use_coarse_to_fine:
+            self.level_interval = int(self.level_interval * factor)
 
         strategy = self.strategy
         if isinstance(strategy, DefaultStrategy):
@@ -293,9 +315,11 @@ def create_splats_with_optimizers(
     scales = torch.log(dist_avg * init_scale).unsqueeze(-1).repeat(1, 3)  # [N, 3]
 
     # Distribute the GSs to different ranks (also works for single rank)
-    points = points[world_rank::world_size]
-    rgbs = rgbs[world_rank::world_size]
-    scales = scales[world_rank::world_size]
+    # NOTE: slicing with step can produce non-contiguous views; make them contiguous to keep
+    # optimizer (including fused Adam) happy.
+    points = points[world_rank::world_size].contiguous()
+    rgbs = rgbs[world_rank::world_size].contiguous()
+    scales = scales[world_rank::world_size].contiguous()
 
     N = points.shape[0]
     quats = torch.rand((N, 4))  # [N, 4]
@@ -310,11 +334,17 @@ def create_splats_with_optimizers(
     ]
 
     if feature_dim is None:
-        # color is SH coefficients.
-        colors = torch.zeros((N, (sh_degree + 1) ** 2, 3))  # [N, K, 3]
-        colors[:, 0, :] = rgb_to_sh(rgbs)
-        params.append(("sh0", torch.nn.Parameter(colors[:, :1, :]), sh0_lr))
-        params.append(("shN", torch.nn.Parameter(colors[:, 1:, :]), shN_lr))
+        # SH coefficients (initialize DC from RGB, higher bands to 0).
+        # IMPORTANT: avoid non-contiguous views like `colors[:, :1, :]` because fused Adam
+        # can error on non-standard strides.
+        sh0 = rgb_to_sh(rgbs).unsqueeze(1)  # [N, 1, 3]
+        shN = torch.zeros(
+            (N, (sh_degree + 1) ** 2 - 1, 3),
+            device=sh0.device,
+            dtype=sh0.dtype,
+        )  # [N, K-1, 3]
+        params.append(("sh0", torch.nn.Parameter(sh0), sh0_lr))
+        params.append(("shN", torch.nn.Parameter(shN), shN_lr))
     else:
         # features will be used for appearance and view-dependent shading
         features = torch.rand(N, feature_dim)  # [N, feature_dim]
@@ -335,17 +365,186 @@ def create_splats_with_optimizers(
         optimizer_class = SelectiveAdam
     else:
         optimizer_class = torch.optim.Adam
-    optimizers = {
-        name: optimizer_class(
-            [{"params": splats[name], "lr": lr * math.sqrt(BS), "name": name}],
-            eps=1e-15 / math.sqrt(BS),
-            # TODO: check betas logic when BS is larger than 10 betas[0] will be zero.
-            betas=(1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
-            fused=True,
+    optimizers = {}
+    for name, _, lr in params:
+        optimizer_kwargs = {
+            "params": [splats[name]],
+            "lr": lr * math.sqrt(BS),
+            "name": name,
+        }
+        optimizer_init_kwargs = {
+            "eps": 1e-15 / math.sqrt(BS),
+            "betas": (1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+        }
+        if optimizer_class != SelectiveAdam:
+            optimizer_init_kwargs["fused"] = True
+        optimizers[name] = optimizer_class(
+            [optimizer_kwargs],
+            **optimizer_init_kwargs,
         )
-        for name, _, lr in params
-    }
     return splats, optimizers
+
+
+def load_hierarchy_leaf_nodes(
+    hierarchy_path: str,
+    parser: Union[ColmapParser, NerfParser],
+    init_opacity: float = 0.1,
+    init_scale: float = 1.0,
+    means_lr: float = 1.6e-4,
+    scales_lr: float = 5e-3,
+    opacities_lr: float = 5e-2,
+    quats_lr: float = 1e-3,
+    sh0_lr: float = 2.5e-3,
+    shN_lr: float = 2.5e-3 / 20,
+    scene_scale: float = 1.0,
+    sh_degree: int = 3,
+    sparse_grad: bool = False,
+    visible_adam: bool = False,
+    batch_size: int = 1,
+    feature_dim: Optional[int] = None,
+    device: str = "cuda",
+    world_rank: int = 0,
+    world_size: int = 1,
+) -> Tuple[torch.nn.ParameterDict, Dict[str, torch.optim.Optimizer], int]:
+    """
+    Load leaf nodes (level 0) from hierarchy and initialize parameters.
+    
+    Position (means) is kept from hierarchy, but other parameters are re-initialized
+    like in simple_trainer_original.py.
+    
+    Args:
+        hierarchy_path: Path to hierarchy.pt file
+        parser: Dataset parser (for getting RGB colors from SfM points)
+        init_opacity: Initial opacity value
+        init_scale: Initial scale multiplier
+        ... (other parameters same as create_splats_with_optimizers)
+        
+    Returns:
+        splats: ParameterDict with leaf node Gaussians
+        optimizers: Dictionary of optimizers
+        num_levels: Number of levels in hierarchy
+    """
+    print(f"Loading hierarchy from {hierarchy_path}...")
+    checkpoint = torch.load(hierarchy_path, map_location=device, weights_only=False)
+    hierarchy = checkpoint["hierarchy"]
+    
+    # Get number of levels from hierarchy
+    num_levels = len(hierarchy["levels"])
+    
+    # Extract leaf nodes (level 0) - use means and scales from hierarchy
+    # Other parameters will be initialized like simple_trainer_original.py
+    level_0 = hierarchy["levels"][0]
+    leaf_means = level_0["means"].to(device).float().contiguous()  # [N, 3]
+    leaf_scales = level_0["scales"].to(device).float().contiguous()  # [N, 3]
+    
+    N = leaf_means.shape[0]
+    print(f"Loaded {N} leaf nodes from hierarchy (total {num_levels} levels)")
+    print("Using means and scales from hierarchy, initializing other parameters like simple_trainer_original.py")
+    
+    # Get RGB colors from SfM points (if available) for SH initialization.
+    have_sfm = (
+        hasattr(parser, "points")
+        and hasattr(parser, "points_rgb")
+        and parser.points is not None
+        and parser.points_rgb is not None
+        and len(parser.points) > 0
+        and len(parser.points_rgb) > 0
+    )
+
+    if have_sfm:
+        # Find nearest SfM points for each leaf node using FAISS (CPU index).
+        print(f"Finding nearest SfM points for {N} leaf nodes using FAISS...")
+        sfm_points_np = np.asarray(parser.points, dtype=np.float32)  # [M, 3]
+        sfm_rgbs = torch.from_numpy(np.asarray(parser.points_rgb, dtype=np.float32) / 255.0).to(device)  # [M, 3]
+        leaf_means_np = leaf_means.detach().cpu().numpy().astype(np.float32)  # [N, 3]
+
+        index = faiss.IndexFlatL2(3)
+        index.add(sfm_points_np)
+        _, nearest_indices_np = index.search(leaf_means_np, 1)  # [N, 1]
+        nearest_indices = torch.from_numpy(nearest_indices_np[:, 0].astype(np.int64)).to(device)
+        print("FAISS search completed")
+
+        rgbs = sfm_rgbs[nearest_indices]  # [N, 3]
+    else:
+        print("[init] parser has no SfM points; initializing colors randomly")
+        rgbs = torch.rand((N, 3), device=device)
+    
+    # Use scales from hierarchy (no need to initialize)
+    
+    # Distribute to different ranks
+    leaf_means = leaf_means[world_rank::world_size].contiguous()
+    leaf_scales = leaf_scales[world_rank::world_size].contiguous()
+    rgbs = rgbs[world_rank::world_size].contiguous()
+    
+    N = leaf_means.shape[0]
+    
+    # Initialize other parameters (like simple_trainer_original.py)
+    quats = torch.rand((N, 4), device=device)  # [N, 4]
+    opacities = torch.logit(torch.full((N,), init_opacity, device=device))  # [N,]
+    
+    params = [
+        # name, value, lr
+        ("means", torch.nn.Parameter(leaf_means), means_lr * scene_scale),
+        ("scales", torch.nn.Parameter(leaf_scales), scales_lr),
+        ("quats", torch.nn.Parameter(quats), quats_lr),
+        ("opacities", torch.nn.Parameter(opacities), opacities_lr),
+    ]
+    
+    if feature_dim is None:
+        # Initialize SH coefficients from RGB (DC) and 0 for higher bands.
+        # IMPORTANT: avoid non-contiguous views because fused Adam can error.
+        sh0 = rgb_to_sh(rgbs).unsqueeze(1)  # [N, 1, 3]
+        shN = torch.zeros(
+            (N, (sh_degree + 1) ** 2 - 1, 3),
+            device=device,
+            dtype=sh0.dtype,
+        )  # [N, K-1, 3]
+        params.append(("sh0", torch.nn.Parameter(sh0), sh0_lr))
+        params.append(("shN", torch.nn.Parameter(shN), shN_lr))
+    else:
+        # Initialize features/colors for appearance optimization (like simple_trainer_original.py)
+        features = torch.rand(N, feature_dim, device=device)
+        params.append(("features", torch.nn.Parameter(features), sh0_lr))
+        colors = torch.logit(torch.clamp(rgbs, 0.0, 1.0))  # [N, 3]
+        params.append(("colors", torch.nn.Parameter(colors), sh0_lr))
+    
+    splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
+    
+    for name, param in splats.items():
+        param = param.contiguous()
+
+    # Create optimizers (same as create_splats_with_optimizers)
+    BS = batch_size * world_size
+    optimizer_class = None
+    if sparse_grad:
+        optimizer_class = torch.optim.SparseAdam
+    elif visible_adam:
+        optimizer_class = SelectiveAdam
+    else:
+        optimizer_class = torch.optim.Adam
+    optimizers = {}
+    for name, _, lr in params:
+        optimizer_kwargs = {
+            "params": [splats[name]],
+            "lr": lr * math.sqrt(BS),
+            "name": name,
+        }
+        optimizer_init_kwargs = {
+            "eps": 1e-15 / math.sqrt(BS),
+            "betas": (1 - BS * (1 - 0.9), 1 - BS * (1 - 0.999)),
+        }
+        if optimizer_class != SelectiveAdam:
+            optimizer_init_kwargs["fused"] = True
+        optimizers[name] = optimizer_class(
+            [optimizer_kwargs],
+            **optimizer_init_kwargs,
+        )
+    
+    return splats, optimizers, num_levels
+
+
+# load_hierarchy_multigrid is now a static method of MultigridGaussians
+# Use MultigridGaussians.load_hierarchy_multigrid() instead
 
 
 class Runner:
@@ -428,13 +627,16 @@ class Runner:
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
-        # Model
+        # Validate hierarchy_path is provided
+        if cfg.hierarchy_path is None:
+            raise ValueError("hierarchy_path is required. Please provide --hierarchy_path <path>")
+
+        # Model: Load from hierarchy (required)
+        print(f"Loading leaf nodes from hierarchy: {cfg.hierarchy_path}")
         feature_dim = 32 if cfg.app_opt else None
-        self.splats, self.optimizers = create_splats_with_optimizers(
-            self.parser,
-            init_type=cfg.init_type,
-            init_num_pts=cfg.init_num_pts,
-            init_extent=cfg.init_extent,
+        self.splats, self.optimizers, self.hierarchy_num_levels = load_hierarchy_leaf_nodes(
+            hierarchy_path=cfg.hierarchy_path,
+            parser=self.parser,
             init_opacity=cfg.init_opa,
             init_scale=cfg.init_scale,
             means_lr=cfg.means_lr,
@@ -453,19 +655,18 @@ class Runner:
             world_rank=world_rank,
             world_size=world_size,
         )
-        print("Model initialized. Number of GS:", len(self.splats["means"]))
+        # Multigrid convention (matches MultigridGaussians / visualize_hierarchy_levels.py):
+        # levels are 1..num_levels where 1=coarsest and num_levels=finest.
+        self.max_level = self.hierarchy_num_levels
+        print("Model initialized from hierarchy. Number of GS:", len(self.splats["means"]))
+        print(f"Hierarchy has {self.hierarchy_num_levels} levels (max_level={self.max_level})")
 
-        # Densification Strategy
-        self.cfg.strategy.check_sanity(self.splats, self.optimizers)
-
-        if isinstance(self.cfg.strategy, DefaultStrategy):
-            self.strategy_state = self.cfg.strategy.initialize_state(
-                scene_scale=self.scene_scale
-            )
-        elif isinstance(self.cfg.strategy, MCMCStrategy):
-            self.strategy_state = self.cfg.strategy.initialize_state()
-        else:
-            assert_never(self.cfg.strategy)
+        # Densification Strategy (disabled when using hierarchy)
+        print("Densification disabled (using hierarchy leaf nodes)")
+        # Create a dummy strategy state that does nothing
+        class DummyStrategyState:
+            pass
+        self.strategy_state = DummyStrategyState()
 
         # Compression Strategy
         self.compression_method = None
@@ -559,6 +760,222 @@ class Runner:
                 output_dir=Path(cfg.result_dir),
                 mode="training",
             )
+    
+    @torch.no_grad()
+    def render_initial_hierarchy_levels(self, num_cameras: int = 3):
+        """
+        Render each hierarchy level before training starts (for visual verification).
+        Loads full hierarchy temporarily for rendering (training uses leaf nodes only).
+        
+        Args:
+            num_cameras: Number of cameras to render
+        """
+        if self.world_rank != 0:
+            # Only render on rank 0
+            return
+        
+        cfg = self.cfg
+        device = self.device
+        
+        print("\n" + "="*60)
+        print("Rendering initial hierarchy levels for visual verification...")
+        print("="*60)
+        print("Note: Training uses leaf nodes only, but rendering uses full hierarchy")
+        
+        # Load full hierarchy temporarily for rendering
+        print(f"Loading full hierarchy from {cfg.hierarchy_path} for rendering...")
+        multigrid_gaussians, _ = MultigridGaussians.load_hierarchy_multigrid(
+            hierarchy_path=cfg.hierarchy_path,
+            parser=self.parser,
+            init_opacity=cfg.init_opa,
+            init_scale=cfg.init_scale,
+            means_lr=cfg.means_lr,
+            scales_lr=cfg.scales_lr,
+            opacities_lr=cfg.opacities_lr,
+            quats_lr=cfg.quats_lr,
+            sh0_lr=cfg.sh0_lr,
+            shN_lr=cfg.shN_lr,
+            scene_scale=self.scene_scale,
+            sh_degree=cfg.sh_degree,
+            sparse_grad=cfg.sparse_grad,
+            visible_adam=cfg.visible_adam,
+            batch_size=cfg.batch_size,
+            device=device,
+            world_rank=0,
+            world_size=1,
+            position_scale_reduction=0.75,
+            max_level=None,
+        )
+        
+        # Create output directory
+        output_dir = os.path.join(cfg.result_dir, "initial_hierarchy_levels")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Get max level and verify level structure
+        if len(multigrid_gaussians.levels) > 0:
+            actual_max_level = int(multigrid_gaussians.levels.max().item())
+            actual_min_level = int(multigrid_gaussians.levels.min().item())
+            unique_levels = sorted(multigrid_gaussians.levels.unique().cpu().tolist())
+            print(f"Hierarchy level structure:")
+            print(f"  Actual levels in data: {unique_levels}")
+            print(f"  Min level: {actual_min_level}, Max level: {actual_max_level}")
+            for level in unique_levels:
+                level_count = (multigrid_gaussians.levels == level).sum().item()
+                print(f"  Level {level}: {level_count} gaussians")
+        else:
+            # Multigrid levels start at 1
+            actual_max_level = 1
+            actual_min_level = 1
+            unique_levels = [1]
+        
+        max_level = int(multigrid_gaussians.max_level) if multigrid_gaussians.max_level is not None else actual_max_level
+        levels_to_render = list(range(1, max_level + 1))
+        print(f"Rendering {len(levels_to_render)} levels: {levels_to_render}")
+        print(f"  Note: Level 1 = coarsest (lowest resolution), Level {max_level} = finest (highest resolution)")
+        
+        # Select cameras from validation set
+        val_indices = list(range(len(self.valset)))
+        if len(val_indices) >= num_cameras:
+            import random
+            random.seed(42)
+            camera_indices = random.sample(val_indices, num_cameras)
+        else:
+            camera_indices = val_indices[:num_cameras] if len(val_indices) > 0 else []
+        
+        print(f"Rendering {len(camera_indices)} cameras: {camera_indices}")
+        
+        # Prepare backgrounds
+        backgrounds = None
+        if cfg.white_background:
+            backgrounds = torch.ones(1, 3, device=device)
+        
+        # Render each camera and each level
+        for cam_idx in camera_indices:
+            # Get camera data
+            data = self.valset[cam_idx]
+            camtoworlds = data["camtoworld"].unsqueeze(0).to(device)  # [1, 4, 4]
+            Ks = data["K"].unsqueeze(0).to(device)  # [1, 3, 3]
+            image_data = data["image"].to(device) / 255.0  # [H, W, C]
+            masks = data["mask"].to(device).unsqueeze(0) if "mask" in data else None  # [1, H, W]
+            
+            # Handle RGBA images
+            if image_data.shape[-1] == 4:
+                pixels_gt = image_data[..., :3]  # [H, W, 3]
+            else:
+                pixels_gt = image_data  # [H, W, 3]
+            
+            height, width = pixels_gt.shape[:2]
+            
+            # Save GT image
+            gt_path = os.path.join(output_dir, f"cam_{cam_idx:04d}_GT.png")
+            gt_image = (pixels_gt.detach().cpu().numpy() * 255).astype(np.uint8)
+            imageio.imwrite(gt_path, gt_image)
+            print(f"  Saved GT to {gt_path}")
+            
+            # Render each level (multigrid levels: 1=coarsest, max_level=finest)
+            for render_level in levels_to_render:
+                # Simple downsampling: each coarser level halves resolution.
+                # Finest (max_level): downsample_factor=1
+                # Coarsest (1): downsample_factor=2^(max_level-1)
+                downsample_factor = 2 ** (max_level - render_level)
+                downsample_factor = max(1, int(downsample_factor))
+                
+                print(f"  Level {render_level}: downsample_factor={downsample_factor}, "
+                      f"render_size={max(1, int(height // downsample_factor))}x{max(1, int(width // downsample_factor))}")
+                
+                # Downsample for rendering
+                if downsample_factor > 1:
+                    # Calculate new dimensions
+                    render_height = max(1, int(height // downsample_factor))
+                    render_width = max(1, int(width // downsample_factor))
+                    
+                    # Downsample Ks (camera intrinsics)
+                    Ks_downsampled = Ks.clone()
+                    Ks_downsampled[:, 0, 0] = Ks[:, 0, 0] / downsample_factor  # fx
+                    Ks_downsampled[:, 1, 1] = Ks[:, 1, 1] / downsample_factor  # fy
+                    Ks_downsampled[:, 0, 2] = Ks[:, 0, 2] / downsample_factor  # cx
+                    Ks_downsampled[:, 1, 2] = Ks[:, 1, 2] / downsample_factor  # cy
+                    
+                    # Downsample masks if provided
+                    masks_downsampled = None
+                    if masks is not None:
+                        masks_bchw = masks.unsqueeze(1).float()  # [1, 1, H, W]
+                        masks_downsampled = F.interpolate(
+                            masks_bchw,
+                            size=(render_height, render_width),
+                            mode='nearest',
+                        )
+                        masks_downsampled = masks_downsampled.squeeze(1).bool()  # [1, H, W]
+                else:
+                    # No downsample needed
+                    render_height = height
+                    render_width = width
+                    Ks_downsampled = Ks
+                    masks_downsampled = masks
+                
+                # Check how many gaussians are visible at this level before rendering
+                multigrid_gaussians.set_visible_mask(render_level)
+                visible_count = multigrid_gaussians.visible_mask.sum().item()
+                total_count = len(multigrid_gaussians.levels)
+                level_mask = (multigrid_gaussians.levels == render_level)
+                level_count = level_mask.sum().item()
+                print(f"    Level {render_level}: {visible_count}/{total_count} gaussians visible "
+                      f"(level {render_level} has {level_count} gaussians)")
+                
+                # Render at downsampled resolution
+                colors, alphas, info = multigrid_gaussians.rasterize_splats(
+                    camtoworlds=camtoworlds,
+                    Ks=Ks_downsampled,
+                    width=render_width,
+                    height=render_height,
+                    level=render_level,
+                    sh_degree=cfg.sh_degree,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    masks=masks_downsampled,
+                    packed=cfg.packed,
+                    sparse_grad=cfg.sparse_grad,
+                    distributed=False,
+                    camera_model=cfg.camera_model,
+                    backgrounds=backgrounds,
+                )  # colors: [1, render_H, render_W, 3]
+                
+                colors = colors[0]  # [render_H, render_W, 3]
+                colors = torch.clamp(colors, 0.0, 1.0)
+                
+                # Debug: Check if rendered image is all black or has very low values
+                color_sum = colors.sum().item()
+                color_mean = colors.mean().item()
+                if color_sum < 1e-6 or color_mean < 1e-6:
+                    print(f"    WARNING: Level {render_level} rendered image is all black or very dark!")
+                    print(f"      color_sum={color_sum:.6f}, color_mean={color_mean:.6f}")
+                    print(f"      visible_count={visible_count}, level_count={level_count}")
+                
+                # Upsample to original resolution if needed
+                if downsample_factor > 1:
+                    # Convert to [1, C, H, W] format for F.interpolate
+                    colors_bchw = colors.permute(2, 0, 1).unsqueeze(0)  # [1, 3, render_H, render_W]
+                    colors_upsampled = F.interpolate(
+                        colors_bchw,
+                        size=(height, width),
+                        mode='bilinear',
+                        align_corners=False,
+                    )
+                    # Convert back to [H, W, 3] format
+                    colors = colors_upsampled.squeeze(0).permute(1, 2, 0)  # [H, W, 3]
+                
+                # Save rendered image
+                render_path = os.path.join(output_dir, f"cam_{cam_idx:04d}_level_{render_level}.png")
+                render_image = (colors.detach().cpu().numpy() * 255).astype(np.uint8)
+                imageio.imwrite(render_path, render_image)
+                print(f"  Saved level {render_level} to {render_path}")
+        
+        # Free temporary multigrid_gaussians
+        del multigrid_gaussians
+        torch.cuda.empty_cache()
+        
+        print(f"\nAll initial hierarchy level visualizations saved to {output_dir}")
+        print("="*60 + "\n")
 
     def rasterize_splats(
         self,
@@ -635,6 +1052,9 @@ class Runner:
         if world_rank == 0:
             with open(f"{cfg.result_dir}/cfg.yml", "w") as f:
                 yaml.dump(vars(cfg), f)
+        
+        # Render initial hierarchy levels for visual verification (before training starts)
+        self.render_initial_hierarchy_levels(num_cameras=3)
 
         max_steps = cfg.max_steps
         init_step = 0
@@ -680,8 +1100,13 @@ class Runner:
         trainloader_iter = iter(trainloader)
 
         # Training loop.
-        global_tic = time.time()
+        global_tic = time.time()  # Start time for total training
+        training_start_time = time.time()  # Start time for actual training (excluding setup)
         pbar = tqdm.tqdm(range(init_step, max_steps))
+        
+        # Training time tracking
+        training_times = []
+        
         for step in pbar:
             if not cfg.disable_viewer:
                 while self.viewer.state == "paused":
@@ -696,20 +1121,96 @@ class Runner:
                 data = next(trainloader_iter)
 
 
-            camtoworlds = camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
-            Ks = data["K"].to(device)  # [1, 3, 3]
-            pixels = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            # Measure training time per step
+            step_start_time = time.time()
+            
+            camtoworlds_gt = data["camtoworld"].to(device)  # [1, 4, 4]
+            Ks_original = data["K"].to(device)  # [1, 3, 3]
+            image_data = data["image"].to(device) / 255.0  # [1, H, W, 3]
+            
+            # Ensure batch dimension exists
+            if camtoworlds_gt.dim() == 2:
+                camtoworlds_gt = camtoworlds_gt.unsqueeze(0)
+            if Ks_original.dim() == 2:
+                Ks_original = Ks_original.unsqueeze(0)
+            if image_data.dim() == 3:
+                image_data = image_data.unsqueeze(0)
+            
+            # Handle RGBA images
+            if image_data.shape[-1] == 4:
+                pixels_gt = image_data[..., :3]  # [1, H, W, 3]
+            else:
+                pixels_gt = image_data  # [1, H, W, 3]
+            
+            original_height, original_width = pixels_gt.shape[1:3]
+            
+            # Coarse-to-fine: calculate target level and downsample
+            target_level = None  # Initialize for later use in description
+            if cfg.use_coarse_to_fine:
+                max_level = self.max_level
+                target_level = min(1 + step // cfg.level_interval, max_level)
+                image_multigrid_max_level = self.max_level
+                
+                # Downsample for coarse-to-fine
+                downsample_factor = 2 ** ((image_multigrid_max_level - target_level) / 2.0)
+                downsample_factor = max(1, downsample_factor)
+                
+                height = int(max(1, original_height / downsample_factor))
+                width = int(max(1, original_width / downsample_factor))
+                
+                # Downsample GT image
+                if downsample_factor > 1:
+                    pixels_bchw = pixels_gt.permute(0, 3, 1, 2)  # [1, 3, H, W]
+                    pixels_downsampled_bchw = F.interpolate(
+                        pixels_bchw,
+                        size=(height, width),
+                        mode='bicubic',
+                        align_corners=False,
+                    )
+                    pixels = pixels_downsampled_bchw.permute(0, 2, 3, 1)  # [1, H, W, 3]
+                else:
+                    pixels = pixels_gt
+                
+                # Downsample Ks
+                Ks = Ks_original.clone()
+                if downsample_factor > 1:
+                    Ks[:, 0, 0] = Ks_original[:, 0, 0] / downsample_factor  # fx
+                    Ks[:, 1, 1] = Ks_original[:, 1, 1] / downsample_factor  # fy
+                    Ks[:, 0, 2] = Ks_original[:, 0, 2] / downsample_factor  # cx
+                    Ks[:, 1, 2] = Ks_original[:, 1, 2] / downsample_factor  # cy
+                else:
+                    Ks = Ks_original
+            else:
+                # Normal training (no coarse-to-fine)
+                pixels = pixels_gt
+                Ks = Ks_original
+                height, width = pixels.shape[1:3]
+            
             num_train_rays_per_step = (
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            if masks is not None and masks.dim() == 2:
+                masks = masks.unsqueeze(0)
+            if cfg.use_coarse_to_fine and masks is not None:
+                # Downsample masks
+                if downsample_factor > 1:
+                    masks_bchw = masks.unsqueeze(1).float()  # [1, 1, H, W]
+                    masks_downsampled_bchw = F.interpolate(
+                        masks_bchw,
+                        size=(height, width),
+                        mode='nearest',
+                    )
+                    masks = masks_downsampled_bchw.squeeze(1).bool()  # [1, H, W]
+            
             if cfg.depth_loss:
                 points = data["points"].to(device)  # [1, M, 2]
                 depths_gt = data["depths"].to(device)  # [1, M]
 
-            height, width = pixels.shape[1:3]
-
+            # Initialize camtoworlds
+            camtoworlds = camtoworlds_gt
+            
             if cfg.pose_noise:
                 camtoworlds = self.pose_perturb(camtoworlds, image_ids)
 
@@ -756,13 +1257,7 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
 
-            self.cfg.strategy.step_pre_backward(
-                params=self.splats,
-                optimizers=self.optimizers,
-                state=self.strategy_state,
-                step=step,
-                info=info,
-            )
+            # Densification disabled (using hierarchy)
 
             # loss
             l1loss = F.l1_loss(colors, pixels)
@@ -798,16 +1293,24 @@ class Runner:
                 loss += cfg.opacity_reg * torch.sigmoid(self.splats["opacities"]).mean()
             if cfg.scale_reg > 0.0:
                 loss += cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
-
+            
             loss.backward()
 
+            # Measure step time
+            step_time = time.time() - step_start_time
+            training_times.append(step_time)
+            
+            # Build description
             desc = f"loss={loss.item():.3f}| " f"sh degree={sh_degree_to_use}| "
+            if cfg.use_coarse_to_fine and target_level is not None:
+                desc += f"level={target_level}| "
             if cfg.depth_loss:
                 desc += f"depth loss={depthloss.item():.6f}| "
             if cfg.pose_opt and cfg.pose_noise:
                 # monitor the pose error if we inject noise
                 pose_err = F.l1_loss(camtoworlds_gt, camtoworlds)
                 desc += f"pose err={pose_err.item():.6f}| "
+            desc += f"time={step_time:.3f}s| "
             pbar.set_description(desc)
 
             # write images (gt and render)
@@ -946,27 +1449,7 @@ class Runner:
             for scheduler in schedulers:
                 scheduler.step()
 
-            # Run post-backward steps after backward and optimizer
-            if isinstance(self.cfg.strategy, DefaultStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    packed=cfg.packed,
-                )
-            elif isinstance(self.cfg.strategy, MCMCStrategy):
-                self.cfg.strategy.step_post_backward(
-                    params=self.splats,
-                    optimizers=self.optimizers,
-                    state=self.strategy_state,
-                    step=step,
-                    info=info,
-                    lr=schedulers[0].get_last_lr()[0],
-                )
-            else:
-                assert_never(self.cfg.strategy)
+            # Densification disabled (using hierarchy)
 
             # Measure metrics (lightweight, no image saving)
             if cfg.metric_interval > 0 and step % cfg.metric_interval == 0:
@@ -997,6 +1480,46 @@ class Runner:
                 )
                 # Update the scene.
                 self.viewer.update(step, num_train_rays_per_step)
+        
+        # Training completed - save training time statistics
+        training_end_time = time.time()
+        total_training_time = training_end_time - training_start_time
+        
+        if world_rank == 0:
+            training_time_stats = {
+                "total_training_time_seconds": total_training_time,
+                "total_training_time_minutes": total_training_time / 60.0,
+                "total_training_time_hours": total_training_time / 3600.0,
+                "average_step_time_seconds": np.mean(training_times) if training_times else 0.0,
+                "median_step_time_seconds": np.median(training_times) if training_times else 0.0,
+                "min_step_time_seconds": np.min(training_times) if training_times else 0.0,
+                "max_step_time_seconds": np.max(training_times) if training_times else 0.0,
+                "total_steps": max_steps,
+                "num_gaussians": len(self.splats["means"]),
+                "hierarchy_path": cfg.hierarchy_path if hasattr(cfg, 'hierarchy_path') else None,
+                "use_coarse_to_fine": cfg.use_coarse_to_fine,
+            }
+            
+            training_time_path = os.path.join(cfg.result_dir, "training_time_stats.json")
+            with open(training_time_path, "w") as f:
+                json.dump(training_time_stats, f, indent=2)
+            
+            print("\n" + "="*80)
+            print("TRAINING TIME STATISTICS")
+            print("="*80)
+            print(f"Total training time: {total_training_time / 60.0:.2f} minutes ({total_training_time / 3600.0:.2f} hours)")
+            print(f"Average step time: {np.mean(training_times):.4f} seconds")
+            print(f"Median step time: {np.median(training_times):.4f} seconds")
+            print(f"Min step time: {np.min(training_times):.4f} seconds")
+            print(f"Max step time: {np.max(training_times):.4f} seconds")
+            print(f"Total steps: {max_steps}")
+            print(f"Number of Gaussians: {len(self.splats['means'])}")
+            print(f"Hierarchy path: {cfg.hierarchy_path}")
+            print(f"Using leaf nodes only: True")
+            if cfg.use_coarse_to_fine:
+                print(f"Coarse-to-fine training: True (max_level={self.max_level}, level_interval={cfg.level_interval})")
+            print(f"Training time stats saved to: {training_time_path}")
+            print("="*80)
 
     @torch.no_grad()
     def measure_metric(self, step: int, stage: str = "val", global_tic: Optional[float] = None) -> Dict[str, float]:
@@ -1024,13 +1547,75 @@ class Runner:
         ellipse_time = 0
         metrics = defaultdict(list)
         
+        # Coarse-to-fine: calculate target level (same as training)
+        if cfg.use_coarse_to_fine:
+            max_level = self.max_level
+            target_level = min(1 + step // cfg.level_interval, max_level)
+            image_multigrid_max_level = self.max_level
+        else:
+            target_level = None
+            image_multigrid_max_level = None
+        
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
-            Ks = data["K"].to(device)
-            pixels = data["image"].to(device) / 255.0
+            Ks_original = data["K"].to(device)
+            image_data = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
             
-            height, width = pixels.shape[1:3]
+            # Handle RGBA images
+            if image_data.shape[-1] == 4:
+                pixels_gt = image_data[..., :3]  # [1, H, W, 3]
+            else:
+                pixels_gt = image_data  # [1, H, W, 3]
+            
+            original_height, original_width = pixels_gt.shape[1:3]
+            
+            # Coarse-to-fine: downsample if needed
+            if cfg.use_coarse_to_fine and target_level is not None:
+                # Downsample for coarse-to-fine (same logic as training)
+                downsample_factor = 2 ** ((image_multigrid_max_level - target_level) / 2.0)
+                downsample_factor = max(1, downsample_factor)
+                
+                height = int(max(1, original_height / downsample_factor))
+                width = int(max(1, original_width / downsample_factor))
+                
+                # Downsample GT image
+                if downsample_factor > 1:
+                    pixels_bchw = pixels_gt.permute(0, 3, 1, 2)  # [1, 3, H, W]
+                    pixels_downsampled_bchw = F.interpolate(
+                        pixels_bchw,
+                        size=(height, width),
+                        mode='bicubic',
+                        align_corners=False,
+                    )
+                    pixels = pixels_downsampled_bchw.permute(0, 2, 3, 1)  # [1, H, W, 3]
+                else:
+                    pixels = pixels_gt
+                
+                # Downsample Ks
+                Ks = Ks_original.clone()
+                if downsample_factor > 1:
+                    Ks[:, 0, 0] = Ks_original[:, 0, 0] / downsample_factor  # fx
+                    Ks[:, 1, 1] = Ks_original[:, 1, 1] / downsample_factor  # fy
+                    Ks[:, 0, 2] = Ks_original[:, 0, 2] / downsample_factor  # cx
+                    Ks[:, 1, 2] = Ks_original[:, 1, 2] / downsample_factor  # cy
+                else:
+                    Ks = Ks_original
+                
+                # Downsample masks if provided
+                if masks is not None and downsample_factor > 1:
+                    masks_bchw = masks.unsqueeze(1).float()  # [1, 1, H, W]
+                    masks_downsampled_bchw = F.interpolate(
+                        masks_bchw,
+                        size=(height, width),
+                        mode='nearest',
+                    )
+                    masks = masks_downsampled_bchw.squeeze(1).bool()  # [1, H, W]
+            else:
+                # Normal metric measurement (no coarse-to-fine)
+                pixels = pixels_gt
+                Ks = Ks_original
+                height, width = original_height, original_width
 
             torch.cuda.synchronize()
             tic = time.time()
@@ -1049,6 +1634,8 @@ class Runner:
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
+            # Clamp pixels to [0, 1] range (may go out of range due to downsampling/upsampling)
+            pixels = torch.clamp(pixels, 0.0, 1.0)
 
             if world_rank == 0:
                 # Compute metrics
@@ -1120,12 +1707,76 @@ class Runner:
         )
         ellipse_time = 0
         metrics = defaultdict(list)
+        
+        # Coarse-to-fine: calculate target level (same as training)
+        if cfg.use_coarse_to_fine:
+            max_level = self.max_level
+            target_level = min(1 + step // cfg.level_interval, max_level)
+            image_multigrid_max_level = self.max_level
+        else:
+            target_level = None
+            image_multigrid_max_level = None
+        
         for i, data in enumerate(valloader):
             camtoworlds = data["camtoworld"].to(device)
-            Ks = data["K"].to(device)
-            pixels = data["image"].to(device) / 255.0
+            Ks_original = data["K"].to(device)
+            image_data = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
-            height, width = pixels.shape[1:3]
+            
+            # Handle RGBA images
+            if image_data.shape[-1] == 4:
+                pixels_gt = image_data[..., :3]  # [1, H, W, 3]
+            else:
+                pixels_gt = image_data  # [1, H, W, 3]
+            
+            original_height, original_width = pixels_gt.shape[1:3]
+            
+            # Coarse-to-fine: downsample if needed
+            if cfg.use_coarse_to_fine and target_level is not None:
+                # Downsample for coarse-to-fine (same logic as training)
+                downsample_factor = 2 ** ((image_multigrid_max_level - target_level) / 2.0)
+                downsample_factor = max(1, downsample_factor)
+                
+                height = int(max(1, original_height / downsample_factor))
+                width = int(max(1, original_width / downsample_factor))
+                
+                # Downsample GT image
+                if downsample_factor > 1:
+                    pixels_bchw = pixels_gt.permute(0, 3, 1, 2)  # [1, 3, H, W]
+                    pixels_downsampled_bchw = F.interpolate(
+                        pixels_bchw,
+                        size=(height, width),
+                        mode='bicubic',
+                        align_corners=False,
+                    )
+                    pixels = pixels_downsampled_bchw.permute(0, 2, 3, 1)  # [1, H, W, 3]
+                else:
+                    pixels = pixels_gt
+                
+                # Downsample Ks
+                Ks = Ks_original.clone()
+                if downsample_factor > 1:
+                    Ks[:, 0, 0] = Ks_original[:, 0, 0] / downsample_factor  # fx
+                    Ks[:, 1, 1] = Ks_original[:, 1, 1] / downsample_factor  # fy
+                    Ks[:, 0, 2] = Ks_original[:, 0, 2] / downsample_factor  # cx
+                    Ks[:, 1, 2] = Ks_original[:, 1, 2] / downsample_factor  # cy
+                else:
+                    Ks = Ks_original
+                
+                # Downsample masks if provided
+                if masks is not None and downsample_factor > 1:
+                    masks_bchw = masks.unsqueeze(1).float()  # [1, 1, H, W]
+                    masks_downsampled_bchw = F.interpolate(
+                        masks_bchw,
+                        size=(height, width),
+                        mode='nearest',
+                    )
+                    masks = masks_downsampled_bchw.squeeze(1).bool()  # [1, H, W]
+            else:
+                # Normal evaluation (no coarse-to-fine)
+                pixels = pixels_gt
+                Ks = Ks_original
+                height, width = original_height, original_width
 
             torch.cuda.synchronize()
             tic = time.time()
@@ -1143,14 +1794,17 @@ class Runner:
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
+            # Clamp pixels to [0, 1] range (may go out of range due to downsampling/upsampling)
+            pixels = torch.clamp(pixels, 0.0, 1.0)
             canvas_list = [pixels, colors]
 
             if world_rank == 0:
                 # write images
                 canvas = torch.cat(canvas_list, dim=2).squeeze(0).cpu().numpy()
                 canvas = (canvas * 255).astype(np.uint8)
+                level_suffix = f"_level{target_level}" if cfg.use_coarse_to_fine and target_level is not None else ""
                 imageio.imwrite(
-                    f"{self.render_dir}/{stage}_step{step}_{i:04d}.png",
+                    f"{self.render_dir}/{stage}_step{step}{level_suffix}_{i:04d}.png",
                     canvas,
                 )
 
@@ -1212,12 +1866,21 @@ class Runner:
         viz_dir = f"{cfg.result_dir}/visualizations"
         os.makedirs(viz_dir, exist_ok=True)
         
+        # Coarse-to-fine: calculate target level and downsample (same as training)
+        if cfg.use_coarse_to_fine:
+            max_level = self.max_level
+            target_level = min(1 + step // cfg.level_interval, max_level)
+            image_multigrid_max_level = self.max_level
+        else:
+            target_level = None
+            image_multigrid_max_level = None
+        
         images_list = []
         for cam_idx in self.viz_camera_indices:
             # Get data for this camera
             data = self.valset[cam_idx]
             camtoworlds = data["camtoworld"].unsqueeze(0).to(device)  # [1, 4, 4]
-            Ks = data["K"].unsqueeze(0).to(device)  # [1, 3, 3]
+            Ks_original = data["K"].unsqueeze(0).to(device)  # [1, 3, 3]
             image_data = data["image"].to(device) / 255.0  # [H, W, C]
             masks = data["mask"].to(device).unsqueeze(0) if "mask" in data else None  # [1, H, W]
             
@@ -1227,7 +1890,54 @@ class Runner:
             else:
                 pixels_gt = image_data  # [H, W, 3]
             
-            height, width = pixels_gt.shape[:2]
+            original_height, original_width = pixels_gt.shape[:2]
+            
+            # Coarse-to-fine: downsample if needed
+            if cfg.use_coarse_to_fine and target_level is not None:
+                # Downsample for coarse-to-fine (same logic as training)
+                downsample_factor = 2 ** ((image_multigrid_max_level - target_level) / 2.0)
+                downsample_factor = max(1, downsample_factor)
+                
+                height = int(max(1, original_height / downsample_factor))
+                width = int(max(1, original_width / downsample_factor))
+                
+                # Downsample GT image
+                if downsample_factor > 1:
+                    pixels_gt_bchw = pixels_gt.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
+                    pixels_gt_downsampled_bchw = F.interpolate(
+                        pixels_gt_bchw,
+                        size=(height, width),
+                        mode='bicubic',
+                        align_corners=False,
+                    )
+                    pixels_gt_downsampled = pixels_gt_downsampled_bchw.squeeze(0).permute(1, 2, 0)  # [H, W, 3]
+                else:
+                    pixels_gt_downsampled = pixels_gt
+                
+                # Downsample Ks
+                Ks = Ks_original.clone()
+                if downsample_factor > 1:
+                    Ks[:, 0, 0] = Ks_original[:, 0, 0] / downsample_factor  # fx
+                    Ks[:, 1, 1] = Ks_original[:, 1, 1] / downsample_factor  # fy
+                    Ks[:, 0, 2] = Ks_original[:, 0, 2] / downsample_factor  # cx
+                    Ks[:, 1, 2] = Ks_original[:, 1, 2] / downsample_factor  # cy
+                else:
+                    Ks = Ks_original
+                
+                # Downsample masks if provided
+                if masks is not None and downsample_factor > 1:
+                    masks_bchw = masks.unsqueeze(1).float()  # [1, 1, H, W]
+                    masks_downsampled_bchw = F.interpolate(
+                        masks_bchw,
+                        size=(height, width),
+                        mode='nearest',
+                    )
+                    masks = masks_downsampled_bchw.squeeze(1).bool()  # [1, H, W]
+            else:
+                # Normal visualization (no coarse-to-fine)
+                height, width = original_height, original_width
+                Ks = Ks_original
+                pixels_gt_downsampled = pixels_gt
             
             # Render
             colors, _, _ = self.rasterize_splats(
@@ -1243,8 +1953,30 @@ class Runner:
             colors = colors[0]  # [H, W, 3]
             colors = torch.clamp(colors, 0.0, 1.0)
             
+            # Upsample to original resolution for visualization
+            if cfg.use_coarse_to_fine and target_level is not None and downsample_factor > 1:
+                # Upsample rendered image to original resolution
+                colors_bchw = colors.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
+                colors_upsampled_bchw = F.interpolate(
+                    colors_bchw,
+                    size=(original_height, original_width),
+                    mode='bicubic',
+                    align_corners=False,
+                )
+                colors_upsampled = colors_upsampled_bchw.squeeze(0).permute(1, 2, 0)  # [H, W, 3]
+                colors = colors_upsampled
+                # Also upsample GT for consistency
+                pixels_gt_downsampled_bchw = pixels_gt_downsampled.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
+                pixels_gt_upsampled_bchw = F.interpolate(
+                    pixels_gt_downsampled_bchw,
+                    size=(original_height, original_width),
+                    mode='bicubic',
+                    align_corners=False,
+                )
+                pixels_gt_downsampled = pixels_gt_upsampled_bchw.squeeze(0).permute(1, 2, 0)  # [H, W, 3]
+            
             # Convert to numpy and stack: [H, W, 3] for GT, [H, W, 3] for render
-            pixels_gt_np = pixels_gt.cpu().numpy()
+            pixels_gt_np = pixels_gt_downsampled.cpu().numpy()
             colors_np = colors.cpu().numpy()
             
             # Stack horizontally: [H, 2*W, 3]
@@ -1257,9 +1989,10 @@ class Runner:
             
             # Convert to uint8 and save as JPG
             final_image_uint8 = (final_image * 255).astype(np.uint8)
-            viz_path = f"{viz_dir}/viz_step_{step:06d}.jpg"
+            level_suffix = f"_level{target_level}" if cfg.use_coarse_to_fine and target_level is not None else ""
+            viz_path = f"{viz_dir}/viz_step_{step:06d}{level_suffix}.jpg"
             imageio.imwrite(viz_path, final_image_uint8, format='jpg', quality=95)
-            print(f"  Saved visualization to {viz_path}")
+            print(f"  Saved visualization to {viz_path} (target_level={target_level if cfg.use_coarse_to_fine else 'N/A'})")
 
     @torch.no_grad()
     def render_traj(self, step: int):
@@ -1473,14 +2206,16 @@ if __name__ == "__main__":
     # Each is a tuple of (CLI description, config object).
     configs = {
         "default": (
-            "Gaussian splatting training using densification heuristics from the original paper.",
+            "Gaussian splatting training using hierarchy leaf nodes (no densification).",
             Config(
+                hierarchy_path=None,  # Must be provided via CLI
                 strategy=DefaultStrategy(verbose=True),
             ),
         ),
         "mcmc": (
-            "Gaussian splatting training using densification from the paper '3D Gaussian Splatting as Markov Chain Monte Carlo'.",
+            "Gaussian splatting training using hierarchy leaf nodes with MCMC strategy (no densification).",
             Config(
+                hierarchy_path=None,  # Must be provided via CLI
                 init_opa=0.5,
                 init_scale=0.1,
                 opacity_reg=0.01,

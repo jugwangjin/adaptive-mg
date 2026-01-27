@@ -41,12 +41,12 @@ class SelectiveAdam(torch.optim.Adam):
 
     """
 
-    def __init__(self, params, eps, betas, **kwargs):
-        # Ignore unsupported Adam kwargs (e.g., fused) to match torch.optim.Adam signature usage
+    def __init__(self, params, eps, betas):
         super().__init__(params=params, eps=eps, betas=betas)
 
     @torch.no_grad()
     def step(self, visibility):
+        N = visibility.numel()
         for group in self.param_groups:
             lr = group["lr"]
             eps = group["eps"]
@@ -56,10 +56,6 @@ class SelectiveAdam(torch.optim.Adam):
             param = group["params"][0]
             if param.grad is None:
                 continue
-            if visibility.device != param.device:
-                visibility = visibility.to(param.device)
-            visibility = visibility.view(-1)
-            N = visibility.numel()
 
             # Lazy state initialization
             state = self.state[param]
@@ -77,38 +73,14 @@ class SelectiveAdam(torch.optim.Adam):
             exp_avg_sq = stored_state["exp_avg_sq"]
             M = param.numel() // N
 
-            if param.is_cuda:
-                adam(
-                    param,
-                    param.grad,
-                    exp_avg,
-                    exp_avg_sq,
-                    visibility,
-                    lr,
-                    beta1,
-                    beta2,
-                    eps,
-                )
-            else:
-                if visibility.dtype != torch.bool:
-                    visible_mask = visibility != 0
-                else:
-                    visible_mask = visibility
-                if not visible_mask.any():
-                    continue
-                visible_indices = torch.where(visible_mask)[0]
-                param_view = param.view(N, -1)
-                grad_view = param.grad.view(N, -1)
-                exp_avg_view = exp_avg.view(N, -1)
-                exp_avg_sq_view = exp_avg_sq.view(N, -1)
-                grad_sel = grad_view[visible_indices]
-                exp_avg_sel = exp_avg_view[visible_indices]
-                exp_avg_sq_sel = exp_avg_sq_view[visible_indices]
-                exp_avg_sel = beta1 * exp_avg_sel + (1.0 - beta1) * grad_sel
-                exp_avg_sq_sel = beta2 * exp_avg_sq_sel + (1.0 - beta2) * grad_sel * grad_sel
-                denom = exp_avg_sq_sel.sqrt().add_(eps)
-                param_view[visible_indices] = param_view[visible_indices] - lr * (
-                    exp_avg_sel / denom
-                )
-                exp_avg_view[visible_indices] = exp_avg_sel
-                exp_avg_sq_view[visible_indices] = exp_avg_sq_sel
+            adam(
+                param,
+                param.grad,
+                exp_avg,
+                exp_avg_sq,
+                visibility,
+                lr,
+                beta1,
+                beta2,
+                eps,
+            )

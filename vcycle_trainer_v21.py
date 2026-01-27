@@ -1,4 +1,6 @@
 """
+*** 망하면 v18 쓰기 
+
 vcycle_trainer_v12.py - Multigrid V-cycle Trainer with Render-based Restriction/Prolongation
 
 VERSION HISTORY AND KEY DIFFERENCES:
@@ -190,6 +192,7 @@ from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_rand
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
+from gsplat.cuda._wrapper import quat_scale_to_covar_preci
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
@@ -198,6 +201,8 @@ from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 from multigrid_gaussians_v8 import MultigridGaussians, quaternion_multiply
 
+import open3d as o3d
+import numpy as np
 
 @dataclass
 class Config:
@@ -316,6 +321,10 @@ class Config:
     opacity_reg: float = 0.0
     # Scale regularization
     scale_reg: float = 0.0
+    # Hierarchy consistency regularization
+    # Enforces that parent gaussians match the aggregation of their children
+    # This ensures consistency between fine and coarse levels
+    hierarchy_consistency_lambda: float = 0.1
     # Position scale reduction for hierarchical gaussians
     # Higher level gaussians are constrained to stay closer to their parents
     position_scale_reduction: float = 0.75
@@ -335,9 +344,9 @@ class Config:
     cycle_type: Literal["vcycle", "inv_fcycle"] = "vcycle"
     
     # V-cycle parameters
-    smoothing_steps: int = 64  # Number of smoothing steps per level
-    solving_steps: int = 64  # Number of solving steps at coarsest level
-    steps_decaying_per_level: float = 0.25
+    smoothing_steps: int = 50  # Number of smoothing steps per level
+    solving_steps: int = 50  # Number of solving steps at coarsest level
+    steps_decaying_per_level: float = 0.75
     restriction_dampling: float = 0.25
     # Render-based restriction/prolongation are applied during smoothing steps
     
@@ -351,7 +360,7 @@ class Config:
     pause_refine_after_level_increase: Optional[int] = None
     
     # Gradient scaling parameters
-    grad_scale_factor: float = 1.2 # Base factor for level-dependent gradient scaling
+    grad_scale_factor: float = 0.8 # Base factor for level-dependent gradient scaling
     # Gradient scale for level L: grad_scale_factor ** (max_level - L)
     # Coarse levels (low L) get larger scale, fine levels (high L) get smaller scale
     
@@ -408,7 +417,7 @@ class Config:
     visualization_interval: int = 1  # 1 = every cycle, 0 = disabled
     # Visualization: save hierarchy visualization (level pointclouds and linesets) at the end of each cycle
     # If > 0, saves hierarchy visualization after each cycle completion
-    hierarchy_visualization_interval: int = 100  # 1 = every cycle, 0 = disabled
+    hierarchy_visualization_interval: int = 10  # 1 = every cycle, 0 = disabled
 
     def __post_init__(self):
         """Auto-generate result_dir if not provided and set strategy parameters based on cycle_type."""
@@ -430,7 +439,7 @@ class Config:
             settings_parts = [
                 f"type_{self.dataset_type}",
                 f"factor_{self.data_factor}",
-                "v18",
+                "v21",
             ]
             if self.dataset_type == "nerf" and self.white_background:
                 settings_parts.append("whitebg")
@@ -442,12 +451,12 @@ class Config:
                 settings_parts.append(f"patch_{self.patch_size}")
             
             settings_str = "_".join(settings_parts)
-            self.result_dir = f"./results/vcycle_trainer_v18_{self.cycle_type}/{dataset_name}_{settings_str}_v1"
+            self.result_dir = f"./results/vcycle_trainer_v21_{self.cycle_type}/{dataset_name}_{settings_str}_v1"
         
         # Set strategy parameters based on cycle_type if not explicitly provided
         if self.reset_every is None:
             if self.cycle_type == "vcycle":
-                self.reset_every = 20
+                self.reset_every = 25
             elif self.cycle_type == "inv_fcycle":
                 self.reset_every = 15
             else:
@@ -575,12 +584,14 @@ def vcycle_recursive(
             
             log_step = min(current_step, total_steps - 1) if total_steps > 0 else current_step
             
-            loss = runner._train_step(
+            # CHANGED: Solve steps use "upwards" direction (children are regularized)
+            loss, losses_dict = runner._train_step(
                 step=log_step,
                 data=data,
                 target_level=level,
                 global_tic=global_tic,
                 apply_grad_scaling=apply_grad_scaling,
+                direction="upwards",  # Solve: children at coarsest level are regularized
             )
             losses.append(loss)
             
@@ -593,7 +604,10 @@ def vcycle_recursive(
             if pbar is not None:
                 pbar.update(1)
                 avg_loss = np.mean(losses) if losses else 0.0
-                desc = f"V-cycle {vcycle_idx}| Solve L{level}| loss={avg_loss:.3f}| step={current_step}/{total_steps}"
+                hier_losses = ""
+                for key, value in losses_dict.items():
+                    hier_losses += f"{key}={value:.3f} "
+                desc = f"V-cycle {vcycle_idx}| Solve L{level}| loss={avg_loss:.3f}| {hier_losses}| step={current_step}/{total_steps}" 
                 pbar.set_description(desc)
         
         return current_step, losses
@@ -639,17 +653,17 @@ def vcycle_recursive(
         # Continue with upward pass (will be handled after restriction block)
         return current_step, losses
     
-    # Get initial hierarchical values for valid gaussians
-    # No gradients needed for restriction (only parameter updates)
-    # Always use current optimized splats (cache is just a hint, computation uses current values)
-    with torch.no_grad():
-        # Pass current_splats=None to use self.splats (which contains current optimized values)
-        initial_splats = runner.multigrid_gaussians.get_splats(level=None, detach_parents=True, current_splats=None)
-        # Store initial values in dict
-        param_keys = ["means", "scales", "quats", "sh0", "shN", "opacities"]
-        initial_params = {key: initial_splats[key][valid_indices].clone().detach() for key in param_keys}
-        # Free initial_splats immediately after extracting needed values
-        del initial_splats
+    # # Get initial hierarchical values for valid gaussians
+    # # No gradients needed for restriction (only parameter updates)
+    # # Always use current optimized splats (cache is just a hint, computation uses current values)
+    # with torch.no_grad():
+    #     # Pass current_splats=None to use self.splats (which contains current optimized values)
+    #     initial_splats = runner.multigrid_gaussians.get_splats(level=None, detach_parents=True, current_splats=None)
+    #     # Store initial values in dict
+    #     param_keys = ["means", "scales", "quats", "sh0", "shN", "opacities"]
+    #     initial_params = {key: initial_splats[key][valid_indices].clone().detach() for key in param_keys}
+    #     # Free initial_splats immediately after extracting needed values
+    #     del initial_splats
     current_smoothing_steps = int(smoothing_steps * (cfg.steps_decaying_per_level ** (max_level - level)))
     current_smoothing_steps = max(1, current_smoothing_steps)
     metric_backgrounds = None
@@ -675,6 +689,9 @@ def vcycle_recursive(
 
     # Metric before down smoothing
     log_level_metric(tag=f"DownPreSmooth L{target_level}", print_metric=False)
+
+    runner.save_visualization(step=current_step, postfix=f"DownPreSmooth_L{target_level}")
+
     # Smoothing steps at current level
     # Residual calculation is now done inside _train_step (view changes every step)
     down_smoothing_views = []
@@ -691,12 +708,14 @@ def vcycle_recursive(
         
         log_step = min(current_step, total_steps - 1) if total_steps > 0 else current_step
         
-        loss = runner._train_step(
+        # CHANGED: Downward pass uses "downwards" direction (parents are regularized)
+        loss, losses_dict = runner._train_step(
             step=log_step,
             data=data,
             target_level=target_level,
             global_tic=global_tic,
             apply_grad_scaling=apply_grad_scaling,
+            direction="downwards",  # Downward: parents at target_level are regularized
         )
         losses.append(loss)
         
@@ -709,16 +728,27 @@ def vcycle_recursive(
         if pbar is not None:
             pbar.update(1)
             avg_loss = np.mean(losses) if losses else 0.0
-            desc = f"V-cycle {vcycle_idx}| Down L{target_level}| loss={avg_loss:.3f}| step={current_step}/{total_steps}"
+            hier_losses = ""
+            for key, value in losses_dict.items():
+                hier_losses += f"{key}={value:.3f} "
+            desc = f"V-cycle {vcycle_idx}| Down L{target_level}| loss={avg_loss:.3f}| {hier_losses}| step={current_step}/{total_steps}"
             pbar.set_description(desc)
 
     log_level_metric(tag=f"Down L{target_level}")
+    
+    # Save visualization after down smoothing
+    metric_step = (
+        min(max(current_step - 1, 0), total_steps - 1)
+        if total_steps > 0
+        else current_step
+    )
+    runner.save_visualization(metric_step, postfix=f"down_L{target_level}")
 
     torch.cuda.empty_cache()
 
     # ========== Render-based Restriction ==========
     # Applied after smoothing at this level
-    if level > coarsest_level:
+    if False and level > coarsest_level:
         coarse_level = level - 1
         restriction_steps = max(1, current_smoothing_steps // 2)
         for data in down_smoothing_views[:restriction_steps]:
@@ -793,7 +823,7 @@ def vcycle_recursive(
                 fine_render_downsampled_bchw = F.interpolate(
                     fine_colors_bchw,
                     size=(coarse_height, coarse_width),
-                    mode="bilinear",
+                    mode="bicubic",
                     align_corners=False,
                 )
                 fine_render_downsampled = fine_render_downsampled_bchw.permute(
@@ -909,18 +939,13 @@ def vcycle_recursive(
         # This operation updates parameter values only, no gradients needed
         # Use no_grad to prevent computation graph accumulation in recursive calls
         with torch.no_grad():
-            # Get final hierarchical values after smoothing
-            # Always use current optimized splats (no caching during optimization)
-            final_splats = runner.multigrid_gaussians.get_splats(level=None, detach_parents=True, current_splats=None)
-            
-            # Calculate changes (delta) for all residual parameters
-            # All parameters are now residual: means, scales, quats, opacities, sh0, shN
+            # CHANGED: Use individual parameters directly (no need for get_splats)
+            # Individual parameters are stored directly in self.splats
+            # Calculate changes (delta) for all parameters
+            # All parameters are now individual: means, scales, quats, opacities, sh0, shN
             child_deltas = {}
             for key in param_keys:
-                child_deltas[key] = (final_splats[key][valid_indices] - initial_params[key]) * cfg.restriction_dampling
-            
-            # Free intermediate tensors
-            del final_splats
+                child_deltas[key] = (runner.multigrid_gaussians.splats[key][valid_indices] - initial_params[key]) * cfg.restriction_dampling
             
             # Get parent indices and child levels for valid gaussians
             valid_parent_indices = parent_indices[valid_indices]  # [K,]
@@ -1000,9 +1025,9 @@ def vcycle_recursive(
     # (visible_mask, parent_indices, has_parent are not used in upward pass)
     del visible_mask, parent_indices, has_parent
     
-    # Note: Prolongation is not needed for residual parameters
-    # Coarse level changes are automatically reflected in fine level through get_splats
-    # which uses parent's current residual values when computing hierarchical structure
+    # Note: Prolongation is not needed for individual parameters
+    # Individual parameters are independent, so coarse level changes don't automatically affect fine level
+    # Hierarchy consistency is enforced via regularization loss instead
 
     # Smoothing/prolongation steps at current level (after returning from coarser level)
     current_smoothing_steps = int(
@@ -1110,7 +1135,7 @@ def vcycle_recursive(
             fine_render_downsampled_bchw = F.interpolate(
                 fine_colors_bchw,
                 size=(coarse_height, coarse_width),
-                mode="bilinear",
+                mode="bicubic",
                 align_corners=False,
             )
             fine_render_downsampled = fine_render_downsampled_bchw.permute(
@@ -1198,6 +1223,7 @@ def vcycle_recursive(
             torch.cuda.empty_cache()
     
     log_level_metric(tag=f"UpPreSmooth L{target_level}")
+    runner.save_visualization(step=current_step, postfix=f"UpPreSmooth_L{target_level}")
 
     # Free stored smoothing views after restriction/prolongation
     del down_smoothing_views
@@ -1214,12 +1240,14 @@ def vcycle_recursive(
         
         log_step = min(current_step, total_steps - 1) if total_steps > 0 else current_step
         
-        loss = runner._train_step(
+        # CHANGED: Upward pass uses "upwards" direction (children are regularized)
+        loss, losses_dict = runner._train_step(
             step=log_step,
             data=data,
             target_level=target_level,
             global_tic=global_tic,
             apply_grad_scaling=apply_grad_scaling,
+            direction="upwards",  # Upward: children at target_level are regularized
         )
         losses.append(loss)
         
@@ -1232,13 +1260,24 @@ def vcycle_recursive(
         if pbar is not None:
             pbar.update(1)
             avg_loss = np.mean(losses) if losses else 0.0
-            desc = f"V-cycle {vcycle_idx}| Up L{target_level}| loss={avg_loss:.3f}| step={current_step}/{total_steps}"
+            hier_losses = ""
+            for key, value in losses_dict.items():
+                hier_losses += f"{key}={value:.3f} "
+            desc = f"V-cycle {vcycle_idx}| Up L{target_level}| loss={avg_loss:.3f}| {hier_losses}| step={current_step}/{total_steps}"
             pbar.set_description(desc)
 
     torch.cuda.empty_cache()
 
     # Metric after up smoothing
     log_level_metric(tag=f"UpPostSmooth L{target_level}", print_metric=False)
+    
+    # Save visualization after up smoothing
+    metric_step = (
+        min(max(current_step - 1, 0), total_steps - 1)
+        if total_steps > 0
+        else current_step
+    )
+    runner.save_visualization(metric_step, postfix=f"up_L{target_level}")
 
     return current_step, losses
 
@@ -1822,7 +1861,7 @@ class Runner:
             pixels_downsampled_bchw = F.interpolate(
                 pixels_bchw,
                 size=(height, width),
-                mode='bilinear',
+                mode='bicubic',
                 align_corners=False,
             )
             pixels_downsampled = pixels_downsampled_bchw.permute(0, 2, 3, 1)  # [1, H, W, 3]
@@ -1874,6 +1913,273 @@ class Runner:
             rendered_colors = renders  # [1, H, W, 3]
         
         return rendered_colors, pixels_downsampled, alphas, info
+
+    def _compute_hierarchy_consistency_loss(
+        self,
+        target_level: int,
+        image_multigrid_max_level: int,
+        direction: Literal["downwards", "upwards"]
+    ) -> float:
+        """
+        Compute hierarchy consistency loss based on direction.
+        
+        CHANGED: Direction-based regularization:
+        - downwards (fine->coarse): Parents are regularized
+          * Compute expected parent parameters from children's actual parameters
+          * Compare with parent's actual parameters
+          * Children are detached (gradient cut), parents receive gradients
+        - upwards (coarse->fine, solve): Children are regularized
+          * Compute expected children parameters from parent's actual parameters
+          * Compare with children's actual parameters
+          * Parents are detached (gradient cut), children receive gradients
+        
+        Only processes gaussians at target_level to match current training level.
+        
+        Args:
+            target_level: Current training level (only gaussians at this level are processed)
+            direction: "downwards" or "upwards" - determines which nodes are regularized
+        
+        Returns:
+            hierarchy_loss: Scalar loss value
+        """
+        device = self.device
+        empty_losses_dict = {
+                        "m": torch.tensor(0.0, device=device),
+                        "c": torch.tensor(0.0, device=device),
+                        "o": torch.tensor(0.0, device=device),
+                        "s0": torch.tensor(0.0, device=device),
+                        "sN": torch.tensor(0.0, device=device),
+                        
+                    }
+        # if upwards and target level is max level, return 0
+        if direction == "upwards" and target_level == image_multigrid_max_level:
+
+            return torch.tensor(0.0, device=device), empty_losses_dict
+
+        multigrid_gaussians = self.multigrid_gaussians
+        
+        # Get hierarchical structure
+        levels = multigrid_gaussians.levels  # [N,]
+        parent_indices = multigrid_gaussians.parent_indices  # [N,]
+        
+        N = len(levels)
+        if N == 0:
+
+            return torch.tensor(0.0, device=device), empty_losses_dict
+        
+        # CHANGED: Filter by target_level - only process gaussians at target_level
+        target_level_mask = (levels == target_level)
+        if not target_level_mask.any():
+
+            return torch.tensor(0.0, device=device), empty_losses_dict
+        
+        # CHANGED: Use individual parameters directly (no need for get_splats)
+        # Individual parameters are stored directly in self.splats
+        actual_splats = multigrid_gaussians.splats
+        
+        if direction == "downwards":
+            # Downwards: target_level-1 (parents)와 target_level (children) 이용
+            # target_level-1의 gaussians가 parents, target_level의 gaussians가 children
+            parent_level = target_level - 1
+            if parent_level < 0:
+                return torch.tensor(0.0, device=device), empty_losses_dict
+            
+            # Find gaussians at parent_level and target_level
+            parent_level_mask = (levels == parent_level)
+            if not parent_level_mask.any():
+                return torch.tensor(0.0, device=device), empty_losses_dict
+            
+            # Children are at target_level
+            children_mask = target_level_mask  # [N,]
+            children_indices = torch.where(children_mask)[0]  # [K,] - children at target_level
+            if len(children_indices) == 0:
+                return torch.tensor(0.0, device=device), empty_losses_dict
+            
+            # Get parent_ids for children
+            parent_ids = parent_indices[children_indices]  # [K,] - parent index for each child
+            
+            # Filter: only keep children whose parents are at parent_level
+            parent_levels_of_children = levels[parent_ids]  # [K,]
+            valid_children_mask = (parent_ids >= 0) & (parent_ids < N) & (parent_levels_of_children == parent_level)
+            if not valid_children_mask.all():
+                children_indices = children_indices[valid_children_mask]
+                parent_ids = parent_ids[valid_children_mask]
+                if len(children_indices) == 0:
+                    return torch.tensor(0.0, device=device), empty_losses_dict
+            
+        else:  # upwards
+            # Upwards: target_level (parents)와 target_level+1 (children) 이용
+            # target_level의 gaussians가 parents, target_level+1의 gaussians가 children
+            child_level = target_level + 1
+            
+            # Find gaussians at target_level and child_level
+            child_level_mask = (levels == child_level)
+            if not child_level_mask.any():
+                return torch.tensor(0.0, device=device), empty_losses_dict
+            
+            # Children are at target_level+1
+            children_mask = child_level_mask  # [N,]
+            children_indices = torch.where(children_mask)[0]  # [K,] - children at target_level+1
+            if len(children_indices) == 0:
+                return torch.tensor(0.0, device=device), empty_losses_dict
+            
+            # Get parent_ids for children
+            parent_ids = parent_indices[children_indices]  # [K,] - parent index for each child
+            
+            # Filter: only keep children whose parents are at target_level
+            parent_levels_of_children = levels[parent_ids]  # [K,]
+            valid_children_mask = (parent_ids >= 0) & (parent_ids < N) & (parent_levels_of_children == target_level)
+            if not valid_children_mask.all():
+                children_indices = children_indices[valid_children_mask]
+                parent_ids = parent_ids[valid_children_mask]
+                if len(children_indices) == 0:
+                    return torch.tensor(0.0, device=device)
+        
+        # COMMON: Extract children parameters (detach will be applied later based on direction)
+        children_means = actual_splats["means"][children_indices]  # [K, 3]
+        children_scales = actual_splats["scales"][children_indices]  # [K, 3]
+        children_quats = actual_splats["quats"][children_indices]  # [K, 4]
+        children_opacities = actual_splats["opacities"][children_indices]  # [K,]
+        children_sh0 = actual_splats["sh0"][children_indices].squeeze(1)  # [K, 3] - sh0 is [N, 1, 3]
+        # children_shN = actual_splats["shN"][children_indices]  # [K, C, 3]
+        
+        # COMMON: Children -> Parent aggregation (same for both directions)
+        # Compute weights for aggregation (no gradient needed)
+        with torch.no_grad():
+            # Compute children's covariance matrices from scale and quaternion
+            children_scales_exp = torch.exp(children_scales).clamp_min(1e-6).clamp_max(1e6)  # [K, 3]
+            children_covars, _ = quat_scale_to_covar_preci(
+                quats=children_quats,
+                scales=children_scales_exp,
+                compute_covar=True,
+                compute_preci=False,
+                triu=False,
+            )  # [K, 3, 3]
+            
+            # Compute weights for aggregation: w'_i = o_i * (det(Σ_i))^(1/3) for 3D Gaussian
+            children_opacities_clamped = torch.sigmoid(children_opacities).clamp_min(1e-8)  # [K,]
+            children_covar_dets = torch.det(children_covars).clamp_min(1e-8)  # [K,]
+            children_covar_det_pow13 = torch.pow(children_covar_dets, 1.0/3.0)  # [K,] - (det)^(1/3) for 3D Gaussian
+            unnormalized_weights = children_opacities_clamped * children_covar_det_pow13  # [K,]
+            
+            # Compute sum of weights per parent using scatter_add
+            parent_weight_sums = torch.zeros(N, device=device, dtype=unnormalized_weights.dtype)
+            parent_weight_sums.scatter_add_(0, parent_ids, unnormalized_weights)
+            
+            # Filter out parents with no children (weight_sum = 0)
+            parent_weight_sum_per_child = parent_weight_sums[parent_ids].clamp_min(1e-8)  # [K,]
+            
+            weights = unnormalized_weights / parent_weight_sum_per_child  # [K,]
+            
+        # Aggregate children to get expected parent parameters
+        # SIMPLIFIED: Use full N-sized tensors, only unique_parents will have non-zero values
+        expected_means = torch.zeros(N, 3, device=device, dtype=children_means.dtype)
+        expected_covars = torch.zeros(N, 3, 3, device=device, dtype=children_covars.dtype)
+        expected_opacities = torch.zeros(N, device=device, dtype=children_opacities.dtype)
+        expected_sh0 = torch.zeros(N, 3, device=device, dtype=children_sh0.dtype)
+        # expected_shN = torch.zeros(N, *children_shN.shape[1:], device=device, dtype=children_shN.dtype)
+        
+        # Mean: μ^(l+1) = Σ w_i^(l) μ_i^(l) (Equation 3)
+        weighted_means = children_means * weights.unsqueeze(-1)  # [K, 3]
+        expected_means.scatter_add_(0, parent_ids.unsqueeze(-1).expand(-1, 3), weighted_means)
+        
+        # Covariance: Σ^(l+1) = Σ w_i^(l) (Σ_i^(l) + (μ_i^(l) - μ^(l+1)) (μ_i^(l) - μ^(l+1))^T) (Equation 4)
+        # Get parent means per child (after scatter_add is complete)
+        parent_means_per_child = expected_means[parent_ids]  # [K, 3]
+        
+        mean_diffs = children_means - parent_means_per_child  # [K, 3]
+        mean_diff_outer = torch.einsum('ki,kj->kij', mean_diffs, mean_diffs)  # [K, 3, 3]
+        # Filter out nan/inf in mean_diff_outer
+         
+        children_covars_with_mean_diff = children_covars + mean_diff_outer  # [K, 3, 3]
+        
+        weighted_covars = children_covars_with_mean_diff * weights.view(-1, 1, 1)  # [K, 3, 3]
+        parent_ids_expanded = parent_ids.view(-1, 1, 1).expand(-1, 3, 3)  # [K, 3, 3]
+        expected_covars.scatter_add_(0, parent_ids_expanded, weighted_covars)  # [N, 3, 3]
+        
+        # Opacity: sum
+        expected_opacities.scatter_add_(0, parent_ids, children_opacities)
+        expected_opacities = expected_opacities.clamp_max(1)
+        
+        # SH0: weighted average
+        weighted_sh0 = children_sh0 * weights.unsqueeze(-1)  # [K, 3]
+        expected_sh0.scatter_add_(0, parent_ids.unsqueeze(-1).expand(-1, 3), weighted_sh0)
+        
+        # SHN: weighted average
+        # shN_dims = children_shN.shape[1:]
+        # weighted_shN = children_shN * weights.view(-1, *([1] * len(shN_dims)))
+        # Use expand (memory efficient view, no copy)
+        # parent_ids_expanded = parent_ids.view(-1, *([1] * len(shN_dims))).expand_as(weighted_shN)
+        # expected_shN.scatter_add_(0, parent_ids_expanded, weighted_shN)
+            
+        # COMMON: Get valid parents (those with children)
+        valid_parents_mask = parent_weight_sums > 1e-8  # [N,]
+        if not valid_parents_mask.any():
+            return torch.tensor(0.0, device=device), empty_losses_dict
+        
+        valid_parent_indices = torch.where(valid_parents_mask)[0]  # [num_valid_parents,]
+        
+        # COMMON: Extract parent parameters for valid parents only
+        parent_means_actual = actual_splats["means"][valid_parent_indices]  # [num_valid_parents, 3]
+        parent_scales_actual = actual_splats["scales"][valid_parent_indices]  # [num_valid_parents, 3]
+        parent_quats_actual = actual_splats["quats"][valid_parent_indices]  # [num_valid_parents, 4]
+        parent_opacities_actual = actual_splats["opacities"][valid_parent_indices]  # [num_valid_parents,]
+        parent_sh0_actual = actual_splats["sh0"][valid_parent_indices].squeeze(1)  # [num_valid_parents, 3] - sh0 is [N, 1, 3]
+        # parent_shN_actual = actual_splats["shN"][valid_parent_indices]  # [num_valid_parents, C, 3]
+        
+        # COMMON: Extract expected values for valid parents only
+        expected_means_parents = expected_means[valid_parent_indices]  # [num_valid_parents, 3]
+        expected_covars_parents = expected_covars[valid_parent_indices]  # [num_valid_parents, 3, 3]
+        expected_opacities_parents = expected_opacities[valid_parent_indices]  # [num_valid_parents,]
+        expected_sh0_parents = expected_sh0[valid_parent_indices]  # [num_valid_parents, 3]
+        # expected_shN_parents = expected_shN[valid_parent_indices]  # [num_valid_parents, C, 3]
+
+        # COMMON: Compute parent's actual covariance matrices
+        parent_scales_exp = torch.exp(parent_scales_actual).clamp_min(1e-6).clamp_max(1e6)
+        parent_covars_actual, _ = quat_scale_to_covar_preci(
+            quats=parent_quats_actual,
+            scales=parent_scales_exp,
+            compute_covar=True,
+            compute_preci=False,
+            triu=False,
+        )  # [num_valid_parents, 3, 3]
+        
+        # DIFFERENT: Apply detach based on direction (only difference between downwards/upwards)
+        if direction == "downwards":
+            # Downwards: children.detach(), parent receives gradients
+            expected_means_parents = expected_means_parents.detach()
+            expected_covars_parents = expected_covars_parents.detach()
+            expected_opacities_parents = expected_opacities_parents.detach()
+            expected_sh0_parents = expected_sh0_parents.detach()
+            # expected_shN_parents = expected_shN_parents.detach()
+        else:  # upwards
+            # Upwards: parent.detach(), children (via expected) receive gradients
+            parent_means_actual = parent_means_actual.detach()
+            parent_covars_actual = parent_covars_actual.detach()
+            parent_opacities_actual = parent_opacities_actual.detach()
+            parent_sh0_actual = parent_sh0_actual.detach()
+            # parent_shN_actual = parent_shN_actual.detach()
+        
+        # COMMON: Compute losses: expected (from children) vs actual (parent)
+        mean_loss = F.mse_loss(expected_means_parents, parent_means_actual)
+        covar_diff = expected_covars_parents - parent_covars_actual
+        covar_loss = (covar_diff ** 2).sum(dim=(1, 2)).mean()
+        opacity_loss = F.mse_loss(expected_opacities_parents, parent_opacities_actual)
+        sh0_loss = F.mse_loss(expected_sh0_parents, parent_sh0_actual)
+        # shN_loss = F.mse_loss(expected_shN_parents, parent_shN_actual)
+        
+        hierarchy_loss = mean_loss + covar_loss + opacity_loss + sh0_loss # + shN_loss
+        
+        losses_dict = {
+            "m": mean_loss,
+            "c": covar_loss,
+            "o": opacity_loss,
+            "s0": sh0_loss,
+            # "sN": shN_loss,
+        }
+
+
+        return hierarchy_loss, losses_dict
 
     @torch.no_grad()
     def measure_metric_on_batch(
@@ -2073,6 +2379,7 @@ class Runner:
         target_level: int,
         global_tic: Optional[float] = None,
         apply_grad_scaling: bool = True,
+        direction: Optional[Literal["downwards", "upwards"]] = None,
     ) -> float:
         """
         Perform a single training step at a specific LOD level.
@@ -2228,7 +2535,7 @@ class Runner:
                     residual_target_downsampled_bchw = F.interpolate(
                         residual_target_downsampled_bchw,
                         size=(current_height, current_width),
-                        mode='bilinear',
+                        mode='bicubic',
                         align_corners=False,
                     )
                     residual_target = residual_target_downsampled_bchw.permute(0, 2, 3, 1)  # [1, H, W, 3]
@@ -2238,7 +2545,7 @@ class Runner:
                     finer_colors_downsampled = F.interpolate(
                         finer_colors_downsampled,
                         size=(current_height, current_width),
-                        mode='bilinear',
+                        mode='bicubic',
                         align_corners=False,
                     )
                     finer_colors_downsampled = finer_colors_downsampled.permute(0, 2, 3, 1)
@@ -2387,6 +2694,20 @@ class Runner:
             scale_reg = cfg.scale_reg * torch.exp(self.splats["scales"]).mean()
             loss = loss + scale_reg.to(device)
             del scale_reg
+        
+        # Hierarchy consistency regularization
+        # Enforces hierarchy consistency based on V-cycle direction:
+        # - downwards (fine->coarse): parents are regularized (children -> parent aggregation)
+        #   * children are detached (gradient cut), parents receive gradients
+        # - upwards (coarse->fine, solve): children are regularized (parent -> children)
+        #   * parents are detached (gradient cut), children receive gradients
+        if cfg.hierarchy_consistency_lambda > 0.0 and direction is not None:
+            hierarchy_loss, losses_dict = self._compute_hierarchy_consistency_loss(
+                target_level=target_level,
+                image_multigrid_max_level=image_multigrid_max_level,
+                direction=direction
+            )
+            loss = loss + cfg.hierarchy_consistency_lambda * hierarchy_loss
 
         # Register gradient hooks for level-dependent scaling
         # Gradient scale for level L: grad_scale_factor ** (max_level - L)
@@ -2606,7 +2927,7 @@ class Runner:
             del points, depths_gt
         torch.cuda.empty_cache()
         
-        return loss.item()
+        return loss.item(), losses_dict
 
     def train(self):
         cfg = self.cfg
@@ -3303,10 +3624,14 @@ class Runner:
             self.writer.flush()
 
     @torch.no_grad()
-    def save_visualization(self, step: int):
+    def save_visualization(self, step: int, postfix: Optional[str] = None):
         """Save visualization images comparing GT and render from sampled cameras.
         
         Saves concatenated images: GT | Level 1 | Level 2 | ... | Level N
+        
+        Args:
+            step: Step number for filename
+            postfix: Optional postfix to add to filename (e.g., "down_L2", "up_L1")
         """
         if self.world_rank != 0:
             return
@@ -3428,7 +3753,7 @@ class Runner:
                     colors_upsampled = F.interpolate(
                         colors_bchw,
                         size=(height, width),
-                        mode='bilinear',
+                        mode='bicubic',
                         align_corners=False,
                     )
                     # Convert back to [H, W, 3] format
@@ -3453,7 +3778,7 @@ class Runner:
         final_canvas = (final_canvas * 255).astype(np.uint8)
         
         # Save single concatenated image
-        viz_path = os.path.join(viz_dir, f"viz_step_{step:06d}.jpg")
+        viz_path = os.path.join(viz_dir, f"viz_step_{step:06d}.jpg") if postfix is None else os.path.join(viz_dir, f"viz_step_{step:06d}_{postfix}.jpg")
         imageio.imwrite(viz_path, final_canvas)
         
         print(f"  Saved visualization to {viz_dir} (levels: {levels_to_render}, cameras: {self.viz_camera_indices})")
@@ -3472,12 +3797,6 @@ class Runner:
         if len(self.multigrid_gaussians.levels) == 0:
             return
         
-        try:
-            import open3d as o3d
-            import numpy as np
-        except ImportError:
-            print("Warning: open3d is not installed. Skipping hierarchy visualization.")
-            return
         
         cfg = self.cfg
         
@@ -3486,7 +3805,8 @@ class Runner:
         os.makedirs(hierarchy_dir, exist_ok=True)
         
         # Get means and levels
-        means = self.multigrid_gaussians.get_splats(level=None, detach_parents=True)["means"].detach().cpu().numpy()  # [N, 3]
+        # Children are now individual (not residual), so we can use splats["means"] directly
+        means = self.multigrid_gaussians.splats["means"].detach().cpu().numpy()  # [N, 3]
         levels = self.multigrid_gaussians.levels.cpu().numpy()  # [N,]
         parent_indices = self.multigrid_gaussians.parent_indices.cpu().numpy()  # [N,]
         
