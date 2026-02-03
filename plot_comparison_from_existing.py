@@ -19,21 +19,22 @@ import numpy as np
 
 # Configuration matching trainer configurations
 DATASET_TYPE = "colmap"
-DATA_DIR = "./dataset/60_v2/garden"  # Default from hierarchy_trainer_simple.py
-DATA_FACTOR = 4  # Default from hierarchy_trainer_simple.py
+DATA_DIR = "./dataset/360_v2/garden"  # Matching train_them.sh
+DATA_FACTOR = 8  # Matching train_them.sh
 WHITE_BACKGROUND = False
 NORMALIZE_WORLD_SPACE = False  # Default from hierarchy_trainer_simple.py
 PATCH_SIZE = None
 
 
 def get_result_directories() -> Dict[str, Optional[str]]:
-    """Get result directories for 3 default configurations:
+    """Get result directories for default configurations:
     1. hierarchy_trainer_simple.py (default)
     2. hierarchy_trainer_simple.py with --use_coarse_to_fine
     3. hierarchy_trainer_vcycle.py
+    4. hierarchy_trainer_vcycle_v2.py
     
     Returns:
-        Dictionary with keys: 'hierarchy_simple', 'hierarchy_simple_c2f', 'hierarchy_vcycle'
+        Dictionary with keys: 'simple', 'simple_c2f', 'vcycle', 'vcycle_v2'
         Values are directory paths or None if not found
     """
     dataset_name = Path(DATA_DIR).name
@@ -51,28 +52,15 @@ def get_result_directories() -> Dict[str, Optional[str]]:
         settings_parts.append(f"patch_{PATCH_SIZE}")
     settings_str = "_".join(settings_parts)
     
-    # Build settings string for vcycle (includes "v18")
-    vcycle_settings_parts = [
-        f"type_{DATASET_TYPE}",
-        f"factor_{DATA_FACTOR}",
-        "v18",
-    ]
-    if DATASET_TYPE == "nerf" and WHITE_BACKGROUND:
-        vcycle_settings_parts.append("whitebg")
-    if NORMALIZE_WORLD_SPACE:
-        vcycle_settings_parts.append("norm")
-    if PATCH_SIZE is not None:
-        vcycle_settings_parts.append(f"patch_{PATCH_SIZE}")
-    vcycle_settings_str = "_".join(vcycle_settings_parts)
-    
     result = {}
     
-    result["simple"] = "./results/hierarchy_trainer_simple/garden_type_colmap_factor_8_hierarchy_hierarchy"
-    result["simple_c2f"] = "./results/hierarchy_trainer_simple/garden_type_colmap_factor_8_hierarchy_hierarchy_c2f"
-    result["vcycle"] = "./results/hierarchy_trainer_vcycle/garden_type_colmap_factor_8_vcycle"
+    result["simple"] = f"./results/hierarchy_trainer_simple/{dataset_name}_{settings_str}_hierarchy_hierarchy"
+    result["simple_c2f"] = f"./results/hierarchy_trainer_simple/{dataset_name}_{settings_str}_hierarchy_hierarchy_c2f"
+    result["vcycle"] = f"./results/hierarchy_trainer_vcycle/{dataset_name}_{settings_str}_hierarchy_hierarchy"
+    result["vcycle_v2"] = f"./results/hierarchy_trainer_vcycle_v2/{dataset_name}_{settings_str}_hierarchy_hierarchy"
+    result["vcycle_v3"] = f"./results/hierarchy_trainer_vcycle_v3/{dataset_name}_{settings_str}_hierarchy_hierarchy"
     
     return result
-    
 
 
 def parse_stats_files(result_dir: Path) -> Dict[str, Dict[int, float]]:
@@ -183,12 +171,14 @@ def plot_metric_on_axis(
         'hierarchy_simple_c2f': ('d-', 'orange', 'Hierarchy Simple (C2F)'),
         'hierarchy_vcycle': ('o-', 'blue', 'Hierarchy V-cycle'),
         'vcycle': ('o-', 'blue', 'V-cycle'),
+        'vcycle_v2': ('^-', 'purple', 'V-cycle v2'),
         'vcycle_default': ('o-', 'blue', 'V-cycle (default)'),
         'vcycle_maxlevel1': ('^-', 'cyan', 'V-cycle (max_level=1)'),
         'simple': ('s-', 'red', 'Simple'),
         'simple_default': ('s-', 'red', 'Simple (default)'),
         'simple_mcmc': ('d-', 'orange', 'Simple (MCMC)'),
         'inv_fcycle': ('^-', 'green', 'Inv-F cycle'),
+        'vcycle_v3': ('^-', 'cyan', 'V-cycle v3'),
     }
     
     # Plot each method
@@ -302,23 +292,40 @@ def main():
     output_dir = Path("comparison_graphs")
     output_dir.mkdir(exist_ok=True)
     
-    # Create combined graph with all metrics
+    # Create combined graph with metrics (excluding num_GS, including time-psnr)
     print("Creating combined comparison graph...")
-    metrics_to_plot = ['psnr', 'ssim', 'lpips', 'num_GS', 'num_GS_finest', 'ellipse_time']
+    
+    # Color and marker styles for different methods
+    styles = {
+        'hierarchy_simple': ('s-', 'red', 'Hierarchy Simple'),
+        'hierarchy_simple_c2f': ('d-', 'orange', 'Hierarchy Simple (C2F)'),
+        'hierarchy_vcycle': ('o-', 'blue', 'Hierarchy V-cycle'),
+        'vcycle': ('o-', 'blue', 'V-cycle'),
+        'vcycle_v2': ('^-', 'purple', 'V-cycle v2'),
+        'vcycle_default': ('o-', 'blue', 'V-cycle (default)'),
+        'vcycle_maxlevel1': ('^-', 'cyan', 'V-cycle (max_level=1)'),
+        'simple': ('s-', 'red', 'Simple'),
+        'simple_default': ('s-', 'red', 'Simple (default)'),
+        'simple_mcmc': ('d-', 'orange', 'Simple (MCMC)'),
+        'inv_fcycle': ('^-', 'green', 'Inv-F cycle'),
+        'vcycle_v3': ('^-', 'cyan', 'V-cycle v3'),
+    }
+    
+    # Metrics to plot: psnr, ssim, lpips, ellipse_time, and time-psnr (5 total)
+    # Exclude num_GS and num_GS_finest
+    metrics_to_plot = ['psnr', 'ssim', 'lpips', 'ellipse_time']
     ylabels = {
         'psnr': 'PSNR (dB)',
         'ssim': 'SSIM',
         'lpips': 'LPIPS',
-        'num_GS': 'Number of Gaussians (Total)',
-        'num_GS_finest': 'Number of Gaussians (Rendered)',
         'ellipse_time': 'Training Time (s)',
     }
     
-    # Create figure with 2x3 subplots (6 metrics, so 2 rows x 3 cols)
+    # Create figure with 2x3 subplots (5 metrics + 1 time-psnr = 6 total)
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     axes = axes.flatten()
     
-    # Plot each metric on a subplot
+    # Plot standard metrics on subplots
     for idx, metric_name in enumerate(metrics_to_plot):
         if idx < len(axes):
             ax = axes[idx]
@@ -329,9 +336,42 @@ def main():
                 ylabel=ylabels.get(metric_name, metric_name.upper())
             )
     
-    # Hide unused subplots
-    for idx in range(len(metrics_to_plot), len(axes)):
-        axes[idx].axis('off')
+    # Plot time-psnr on the 5th subplot (index 4)
+    ax_time_psnr = axes[4]
+    for method_name, method_data in all_data.items():
+        if 'psnr' not in method_data or 'ellipse_time' not in method_data:
+            continue
+        
+        psnr_data = method_data['psnr']
+        time_data = method_data['ellipse_time']
+        
+        # Extract time-psnr pairs for each step in this method
+        # Each method is processed independently with its own step data
+        time_psnr_pairs = []
+        for step in sorted(set(psnr_data.keys()) & set(time_data.keys())):
+            # For each step, extract the corresponding time and psnr values
+            time_psnr_pairs.append((time_data[step], psnr_data[step]))
+        
+        if len(time_psnr_pairs) == 0:
+            continue
+        
+        # Sort by time (x-axis) for plotting
+        time_psnr_pairs.sort(key=lambda x: x[0])
+        time_values = [pair[0] for pair in time_psnr_pairs]
+        psnr_values = [pair[1] for pair in time_psnr_pairs]
+        
+        style, color, label = styles.get(method_name, ('o-', 'gray', method_name))
+        ax_time_psnr.plot(time_values, psnr_values, style, label=label, 
+               linewidth=2, markersize=6, alpha=0.8, color=color)
+    
+    ax_time_psnr.set_xlabel('Training Time per Image (s)', fontsize=11)
+    ax_time_psnr.set_ylabel('PSNR (dB)', fontsize=11)
+    ax_time_psnr.set_title('PSNR vs Training Time', fontsize=12, fontweight='bold')
+    ax_time_psnr.legend(fontsize=9)
+    ax_time_psnr.grid(True, alpha=0.3)
+    
+    # Hide unused subplot (6th one, index 5)
+    axes[5].axis('off')
     
     # Adjust layout and save
     plt.tight_layout()
@@ -341,7 +381,7 @@ def main():
     print(f"Combined graph saved to: {output_path}")
     plt.close()
     
-    print(f"\nGraph saved to: {output_path}")
+    print(f"\nGraphs saved to: {output_dir}")
     print("\nComparison complete!")
 
 

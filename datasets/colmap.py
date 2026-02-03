@@ -1,11 +1,12 @@
 import json
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import imageio.v2 as imageio
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
 # Fix for pycolmap: np.uint64(-1) fails in Python 3.11+ with newer numpy
@@ -393,6 +394,9 @@ class Dataset:
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self._image_cache = {}
+        self._mask_cache = {}
+        self._downsample_cache = {}
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -401,6 +405,54 @@ class Dataset:
 
     def __len__(self):
         return len(self.indices)
+    
+    def cache_image(
+        self,
+        image_id: int,
+        image: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        if self.patch_size is not None:
+            return
+        if image_id not in self._image_cache:
+            self._image_cache[image_id] = image.detach().cpu()
+        if mask is not None and image_id not in self._mask_cache:
+            self._mask_cache[image_id] = mask.detach().cpu()
+    
+    def get_downsampled(
+        self, image_id: int, downsample_factor: int
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.patch_size is not None or downsample_factor <= 1:
+            return None, None
+        key = (image_id, int(downsample_factor))
+        cached = self._downsample_cache.get(key)
+        if cached is not None:
+            return cached
+        image = self._image_cache.get(image_id)
+        if image is None:
+            return None, None
+        height = max(1, int(image.shape[0] // downsample_factor))
+        width = max(1, int(image.shape[1] // downsample_factor))
+        image_bchw = image.permute(2, 0, 1).unsqueeze(0).float()
+        image_down_bchw = F.interpolate(
+            image_bchw,
+            size=(height, width),
+            mode="bicubic",
+            align_corners=False,
+        )
+        image_down = image_down_bchw.squeeze(0).permute(1, 2, 0).contiguous()
+        mask_down = None
+        mask = self._mask_cache.get(image_id)
+        if mask is not None:
+            mask_bchw = mask.unsqueeze(0).unsqueeze(0).float()
+            mask_down_bchw = F.interpolate(
+                mask_bchw,
+                size=(height, width),
+                mode="nearest",
+            )
+            mask_down = mask_down_bchw.squeeze(0).squeeze(0).bool()
+        self._downsample_cache[key] = (image_down, mask_down)
+        return image_down, mask_down
 
     def __getitem__(self, item: int) -> Dict[str, Any]:
         index = self.indices[item]

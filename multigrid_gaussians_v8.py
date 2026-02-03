@@ -10,7 +10,6 @@ from typing import Dict, List, Optional, Tuple, Union, Literal
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
@@ -54,7 +53,7 @@ def child_to_parent_delta(
     position_scale_reduction: float,
     parent_levels: Tensor,
 ) -> Tensor:
-    """ㅑ
+    """
     Convert child parameter delta to parent delta (restriction).
     
     This is the inverse operation of parent_to_child_param:
@@ -651,6 +650,8 @@ class MultigridGaussians:
         self.parent_indices = parent_indices
         # Initialize visible_mask (all True by default)
         self.visible_mask = torch.ones(N, dtype=torch.bool, device=device)
+        self._visible_mask_cache_level = None
+        self._visible_mask_cache_size = N
         # Position scale reduction factor for hierarchical structure
         # Higher level gaussians are constrained to stay closer to their parents
         self.position_scale_reduction = position_scale_reduction
@@ -1054,6 +1055,13 @@ class MultigridGaussians:
         """
         device = self.levels.device
         N = len(self.levels)
+        if (
+            self._visible_mask_cache_level == level
+            and self.visible_mask is not None
+            and self.visible_mask.numel() == N
+            and self._visible_mask_cache_size == N
+        ):
+            return self.visible_mask
         
         # Initialize all as visible
         visible_mask = torch.ones(N, dtype=torch.bool, device=device)
@@ -1085,6 +1093,8 @@ class MultigridGaussians:
         
         # Store the mask as instance attribute
         self.visible_mask = visible_mask
+        self._visible_mask_cache_level = level
+        self._visible_mask_cache_size = N
         
         return visible_mask
     
@@ -1169,6 +1179,8 @@ class MultigridGaussians:
             # Finest level: all gaussians are visible, no need to compute mask
             visible_mask = torch.ones(len(self.levels), dtype=torch.bool, device=self.levels.device)
             self.visible_mask = visible_mask
+            self._visible_mask_cache_level = render_level
+            self._visible_mask_cache_size = len(self.levels)
             visible_indices = torch.arange(len(self.levels), device=self.levels.device)
         else:
             # Coarser levels: need to compute visible mask

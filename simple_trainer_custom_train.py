@@ -210,7 +210,7 @@ class Config:
     def __post_init__(self):
         """Auto-generate result_dir if not provided."""
         from pathlib import Path
-        
+
         if self.data_dir is None:
             if self.dataset_type == "colmap":
                 self.data_dir = "./dataset/60_v2/garden"
@@ -218,26 +218,25 @@ class Config:
                 self.data_dir = "/Bean/data/gwangjin/2025/3dgs/lego"
             else:
                 raise ValueError(f"Unknown dataset_type: {self.dataset_type}")
-        
-        # Always regenerate result_dir to ensure it matches current CLI arguments
-        # (e.g., if data_factor was changed via CLI, result_dir should reflect that)
-        # Extract dataset name from data_dir (last directory component)
-        dataset_name = Path(self.data_dir).name
-        
-        # Build settings string
-        settings_parts = [
-            f"type_{self.dataset_type}",
-            f"factor_{self.data_factor}",
-        ]
-        if self.dataset_type == "nerf" and self.white_background:
-            settings_parts.append("whitebg")
-        if self.normalize_world_space:
-            settings_parts.append("norm")
-        if self.patch_size is not None:
-            settings_parts.append(f"patch_{self.patch_size}")
-        
-        settings_str = "_".join(settings_parts)
-        self.result_dir = f"./results/simple_trainer_original/{dataset_name}_{settings_str}"
+
+        if self.result_dir is None:
+            # Extract dataset name from data_dir (last directory component)
+            dataset_name = Path(self.data_dir).name
+
+            # Build settings string
+            settings_parts = [
+                f"type_{self.dataset_type}",
+                f"factor_{self.data_factor}",
+            ]
+            if self.dataset_type == "nerf" and self.white_background:
+                settings_parts.append("whitebg")
+            if self.normalize_world_space:
+                settings_parts.append("norm")
+            if self.patch_size is not None:
+                settings_parts.append(f"patch_{self.patch_size}")
+
+            settings_str = "_".join(settings_parts)
+            self.result_dir = f"./results/simple_trainer_original/{dataset_name}_{settings_str}"
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]

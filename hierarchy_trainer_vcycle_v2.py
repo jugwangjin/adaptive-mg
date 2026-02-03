@@ -1,16 +1,22 @@
 """
-*** 망하면 v18 쓰기 
-
-vcycle_trainer_v12.py - Multigrid V-cycle Trainer with Hierarchy Consistency Loss
+hierarchy_trainer_vcycle_v2.py - Multigrid V-cycle Trainer with 2D Projection-based Hierarchy Consistency Loss
 
 VERSION HISTORY AND KEY DIFFERENCES:
 
-v12 (Current):
+v2 (Current):
+    - **2D Projection-based Consistency**: Uses rasterization projection data (means2d, colors, conics, opacities) instead of 3D parameters
+    - **Dual-level Rendering**: Renders both current level and adjacent level (parent/child) for consistency computation
+    - **2D Covariance Weights**: Uses 2D covariance determinants (from conics) for aggregation weights
+    - **Image-space Consistency**: Enforces consistency in image space, improving image-level alignment
     - **View Sampling Per Step**: Each step samples a new view from trainloader (no fixed views)
     - **Independent Step Counts**: `smoothing_steps` and `solving_steps` are independent config parameters
     - **Hierarchy Consistency Loss**: Uses hierarchy consistency loss to enforce parent-child relationships
     - **Simplified Code**: Removed view caching and fixed view logic for cleaner implementation
     - **No Restriction/Prolongation**: Hierarchy consistency loss replaces render-based restriction/prolongation
+
+v1 (Previous):
+    - **3D Parameter-based Consistency**: Used 3D means, covariances, opacities, SH coefficients
+    - **Single-level Rendering**: Only rendered current level, computed consistency from 3D parameters
 
 v11:
     - Fixed views within V-cycle (removed in v12)
@@ -32,54 +38,11 @@ Implementation Notes:
 ---------------------
 - Hierarchy consistency loss is applied during smoothing steps (downward/upward)
 - Direction-based regularization:
-  - downwards: parents are regularized (children -> parent aggregation)
-  - upwards: children are regularized (parent -> children)
+  - downwards: parents are regularized (children -> parent aggregation in 2D space)
+  - upwards: children are regularized (parent -> children in 2D space)
 - Gradient flow: detach() is crucial to prevent unwanted gradient propagation
-
-VERSION HISTORY AND KEY DIFFERENCES:
-
-v12 (Current):
-    - **View Sampling Per Step**: Each step samples a new view from trainloader (no fixed views)
-    - **Independent Step Counts**: `smoothing_steps` and `solving_steps` are independent config parameters
-    - **Hierarchy Consistency Loss**: Uses hierarchy consistency loss to enforce parent-child relationships
-    - **Simplified Code**: Removed view caching and fixed view logic for cleaner implementation
-    - **No Restriction/Prolongation**: Hierarchy consistency loss replaces render-based restriction/prolongation
-    - **Result Directory**: Updated to `vcycle_trainer_v12_{cycle_type}`
-
-v11:
-    - Fixed views within V-cycle (removed in v12)
-    - View caching for efficiency (removed in v12)
-    - Unified step counts based on num_cycle_views (removed in v12)
-
-v10:
-    - Render-based restriction/prolongation implementation
-    - View sampling per step
-    - Uses `multigrid_v10` and `multigrid_gaussians_v4`
-    - `init_level1_ratio: float = 0.9`
-    - Result directory: `multigrid_v10_{cycle_type}`
-
-v9:
-    - Render-based restriction/prolongation implementation
-
-v8:
-    - Cycle-based visualization and evaluation intervals
-    - Gradient inheritance for color gradients
-    - Integrated `is_grad_high` flag (grad2d OR color_grad)
-
-v7:
-    - Various improvements to densification logic
-
-v6:
-    - **multigrid_gaussians_v2**: Uses v2 with helper functions for parent<->child conversion
-    
-    - **Result Directory**: Includes "v6" and "randbkgd" flag in path
-
-v5 (Previous):
-    - Basic V-cycle implementation
-
-v4 and earlier:
-    - Basic V-cycle implementation
-    - May have had different parameter handling
+- 2D projection consistency: Uses means2d, colors (SH evaluated), conics (2D covariance), opacities
+- Weight computation: Uses sqrt(det(Σ_2D)) = 1/sqrt(det(conic)) for aggregation weights
 """
 
 import json
@@ -241,11 +204,7 @@ class Config:
     # Hierarchy consistency regularization
     # Enforces that parent gaussians match the aggregation of their children
     # This ensures consistency between fine and coarse levels
-    hierarchy_consistency_lambda: float = 1
-    # Weight one-hot regularization
-    # Encourages weights to be one-hot like (sparse) by minimizing entropy
-    # This makes aggregation more selective (one child dominates per parent)
-    weight_onehot_lambda: float = 0.1
+    hierarchy_consistency_lambda: float = 1.0
     # Position scale reduction for hierarchical gaussians
     # Higher level gaussians are constrained to stay closer to their parents
     position_scale_reduction: float = 0.75
@@ -265,8 +224,8 @@ class Config:
     cycle_type: Literal["vcycle", "inv_fcycle"] = "vcycle"
     
     # V-cycle parameters
-    smoothing_steps: int = 32  # Number of smoothing steps per level
-    solving_steps: int = 32  # Number of solving steps at coarsest level
+    smoothing_steps: int = 64  # Number of smoothing steps per level
+    solving_steps: int = 64  # Number of solving steps at coarsest level
     steps_decaying_per_level: float = 0.5
     
     
@@ -367,7 +326,7 @@ class Config:
                 settings_parts.append(f"patch_{self.patch_size}")
             
             settings_str = "_".join(settings_parts)
-            result_base = f"./results/hierarchy_trainer_vcycle/{dataset_name}_{settings_str}"
+            result_base = f"./results/hierarchy_trainer_vcycle_v2/{dataset_name}_{settings_str}"
             if self.hierarchy_path is not None:
                 hierarchy_name = Path(self.hierarchy_path).stem
                 result_base += f"_hierarchy_{hierarchy_name}"
@@ -649,10 +608,10 @@ def perform_vcycle(
     # Ensure coarsest_level is valid
     coarsest_level = max(1, min(coarsest_level, max_level))  # Clamp to [1, max_level]
     
-    # Gradient scaling hooks are registered via runner._update_grad_scaling_hooks()
-    # which is called after densification. Since densification is disabled
-    # in hierarchy_trainer_vcycle.py, hooks are never registered.
-    # For vcycle_trainer_v21.py, hooks are updated after densification.
+        # Gradient scaling hooks are registered via runner._update_grad_scaling_hooks()
+        # which is called after densification. Since densification is disabled
+        # in hierarchy_trainer_vcycle_v2.py, hooks are never registered.
+        # For vcycle_trainer_v21.py, hooks are updated after densification.
 
     # Call recursive V-cycle starting from max_level
     current_step, losses = vcycle_recursive(
@@ -1073,10 +1032,7 @@ class Runner:
             actual_min_level = 1
             unique_levels = [1]
         
-        # Use cfg.max_level to determine which levels to render
-        max_level = cfg.max_level if cfg.max_level is not None else actual_max_level
-        # Clamp to actual_max_level to avoid rendering non-existent levels
-        max_level = min(max_level, actual_max_level)
+        max_level = int(self.multigrid_gaussians.max_level) if self.multigrid_gaussians.max_level is not None else actual_max_level
         levels_to_render = list(range(1, max_level + 1))
         print(f"Rendering {len(levels_to_render)} levels: {levels_to_render}")
         print(f"  Note: Level 1 = coarsest (lowest resolution), Level {max_level} = finest (highest resolution)")
@@ -1259,7 +1215,7 @@ class Runner:
         Update gradient scaling hooks based on current hierarchy structure.
         This should be called after densification when hierarchy structure changes.
         
-        For hierarchy_trainer_vcycle.py: densification is disabled, so this is never called.
+        For hierarchy_trainer_vcycle_v2.py: densification is disabled, so this is never called.
         For vcycle_trainer_v21.py: call this after densification to update hooks.
         """
         cfg = self.cfg
@@ -1814,684 +1770,419 @@ class Runner:
         info_other: Optional[Dict] = None,
         children_indices: Optional[torch.Tensor] = None,
         parent_ids: Optional[torch.Tensor] = None,
-    ) -> float:
+    ) -> Tuple[Tensor, Dict[str, Tensor]]:
         """
-        Compute hierarchy consistency loss based on direction.
-        
-        CHANGED: Direction-based regularization:
-        - downwards (fine->coarse): Parents are regularized
-          * Compute expected parent parameters from children's actual parameters
-          * Compare with parent's actual parameters
-          * Children are detached (gradient cut), parents receive gradients
-        - upwards (coarse->fine, solve): Children are regularized
-          * Compute expected children parameters from parent's actual parameters
-          * Compare with children's actual parameters
-          * Parents are detached (gradient cut), children receive gradients
-        
-        Only processes gaussians at target_level to match current training level.
-        
-        Args:
-            target_level: Current training level (only gaussians at this level are processed)
-            image_multigrid_max_level: Maximum level for image multigrid
-            direction: "downwards" or "upwards" - determines which nodes are regularized
-            children_indices: Optional precomputed children indices [K,]. If None, will be computed.
-            parent_ids: Optional precomputed parent IDs for children [K,]. If None, will be computed.
-        
-        Returns:
-            hierarchy_loss: Scalar loss value
-            losses_dict: Dictionary of individual loss components
+        Compute hierarchy consistency loss in 2D projection space.
+
+        Uses rasterization info (means2d, colors, conics, opacities) from two levels:
+        - downwards: current level (children) and current level-1 (parents)
+        - upwards: current level (parents) and current level+1 (children)
         """
         device = self.device
         cfg = self.cfg
         empty_losses_dict = {
-                        "m": torch.tensor(0.0, device=device),
-                        "c": torch.tensor(0.0, device=device),
-                        "o": torch.tensor(0.0, device=device),
-                        "s0": torch.tensor(0.0, device=device),
-                        "sN": torch.tensor(0.0, device=device),
-                        "w_onehot": torch.tensor(0.0, device=device),
-                    }
+            "m": torch.tensor(0.0, device=device),
+            "c": torch.tensor(0.0, device=device),
+            "o": torch.tensor(0.0, device=device),
+            "s0": torch.tensor(0.0, device=device),
+            "sN": torch.tensor(0.0, device=device),
+        }
         # Note: Early return for missing children is handled naturally when computing children_indices
         # (e.g., upwards with target_level+1 > max_level will result in empty children_indices)
+        if info_current is None or info_other is None:
+            return torch.tensor(0.0, device=device), empty_losses_dict
 
         # Profile timing for detailed breakdown
-        profile_detail = hasattr(cfg, 'profile_timing') and cfg.profile_timing
+        profile_detail = hasattr(cfg, "profile_timing") and cfg.profile_timing
         timings = {}
-        
+
         if profile_detail:
             torch.cuda.synchronize()
             t0 = time.time()
 
         multigrid_gaussians = self.multigrid_gaussians
-        
+
         # Get hierarchical structure
         levels = multigrid_gaussians.levels  # [N,]
         parent_indices = multigrid_gaussians.parent_indices  # [N,]
-        
+
         N = len(levels)
         if N == 0:
-
             return torch.tensor(0.0, device=device), empty_losses_dict
-        
+
+        # Validate expected levels for projection data
+        if direction == "downwards":
+            parent_level = target_level - 1
+            if parent_level < 1:
+                return torch.tensor(0.0, device=device), empty_losses_dict
+            if info_current.get("render_level", target_level) != target_level:
+                return torch.tensor(0.0, device=device), empty_losses_dict
+            if info_other.get("render_level", parent_level) != parent_level:
+                return torch.tensor(0.0, device=device), empty_losses_dict
+        else:
+            child_level = target_level + 1
+            # No max_level check - rely on parent/children existence check below
+            if info_current.get("render_level", target_level) != target_level:
+                return torch.tensor(0.0, device=device), empty_losses_dict
+            if info_other.get("render_level", child_level) != child_level:
+                return torch.tensor(0.0, device=device), empty_losses_dict
+
         # Compute children_indices and parent_ids if not provided
         if profile_detail:
             torch.cuda.synchronize()
             t1 = time.time()
-            timings['init'] = (t1 - t0) * 1000
+            timings["init"] = (t1 - t0) * 1000
         # Include max_level in cache key to invalidate cache when max_level changes
         max_level = cfg.max_level if cfg.max_level is not None else image_multigrid_max_level
         cache_key = (target_level, max_level)
         cache_for_direction = self._hierarchy_index_cache[direction]
         
-        with torch.no_grad():
-            if children_indices is None or parent_ids is None:
-                cached_data = cache_for_direction.get(cache_key)
-                if cached_data is not None:
-                    # Use cached indices and mappings
-                    if isinstance(cached_data, tuple) and len(cached_data) == 5:
-                        # Extended cache: (children_indices, parent_ids, valid_parent_ids, parent_id_to_valid_idx, mapped_parent_ids)
-                        children_indices, parent_ids, valid_parent_ids, parent_id_to_valid_idx, mapped_parent_ids = cached_data
-                        num_valid_parents = len(valid_parent_ids) if valid_parent_ids is not None else None
-                    else:
-                        # Legacy cache: (children_indices, parent_ids)
-                        children_indices, parent_ids = cached_data
-                        valid_parent_ids = None
-                        parent_id_to_valid_idx = None
-                        mapped_parent_ids = None
-                        num_valid_parents = None
-                else:
-                    # CHANGED: Filter by target_level - only process gaussians at target_level
-                    target_level_mask = (levels == target_level)
-                    if not target_level_mask.any():
+        if children_indices is None or parent_ids is None:
+            cached_pair = cache_for_direction.get(cache_key)
+            if cached_pair is not None and isinstance(cached_pair, tuple):
+                children_indices, parent_ids = cached_pair[:2]
+            else:
+                # Filter by target_level - only process gaussians at target_level
+                target_level_mask = levels == target_level
+                if not target_level_mask.any():
+                    # Cache empty result
+                    empty_children = torch.tensor([], dtype=torch.long, device=device)
+                    empty_parents = torch.tensor([], dtype=torch.long, device=device)
+                    cache_for_direction[cache_key] = (empty_children, empty_parents)
+                    return torch.tensor(0.0, device=device), empty_losses_dict
+
+                if direction == "downwards":
+                    parent_level = target_level - 1
+                    if parent_level < 1:
                         # Cache empty result
                         empty_children = torch.tensor([], dtype=torch.long, device=device)
                         empty_parents = torch.tensor([], dtype=torch.long, device=device)
-                        cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
+                        cache_for_direction[cache_key] = (empty_children, empty_parents)
                         return torch.tensor(0.0, device=device), empty_losses_dict
-                    
-                    if direction == "downwards":
-                        # Downwards: target_level-1 (parents)와 target_level (children) 이용
-                        # target_level-1의 gaussians가 parents, target_level의 gaussians가 children
-                        parent_level = target_level - 1
-                        if parent_level < 0:
-                            # Cache empty result
-                            empty_children = torch.tensor([], dtype=torch.long, device=device)
-                            empty_parents = torch.tensor([], dtype=torch.long, device=device)
-                            cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                            return torch.tensor(0.0, device=device), empty_losses_dict
-                        
-                        # Find gaussians at parent_level and target_level
-                        parent_level_mask = (levels == parent_level)
-                        if not parent_level_mask.any():
-                            # Cache empty result
-                            empty_children = torch.tensor([], dtype=torch.long, device=device)
-                            empty_parents = torch.tensor([], dtype=torch.long, device=device)
-                            cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                            return torch.tensor(0.0, device=device), empty_losses_dict
-                        
-                        # Children are at target_level
-                        children_mask = target_level_mask  # [N,]
-                        children_indices = torch.where(children_mask)[0]  # [K,] - children at target_level
+                    parent_level_mask = levels == parent_level
+                    if not parent_level_mask.any():
+                        # Cache empty result
+                        empty_children = torch.tensor([], dtype=torch.long, device=device)
+                        empty_parents = torch.tensor([], dtype=torch.long, device=device)
+                        cache_for_direction[cache_key] = (empty_children, empty_parents)
+                        return torch.tensor(0.0, device=device), empty_losses_dict
+
+                    children_indices = torch.where(target_level_mask)[0]
+                    if len(children_indices) == 0:
+                        # Cache empty result
+                        empty_children = torch.tensor([], dtype=torch.long, device=device)
+                        empty_parents = torch.tensor([], dtype=torch.long, device=device)
+                        cache_for_direction[cache_key] = (empty_children, empty_parents)
+                        return torch.tensor(0.0, device=device), empty_losses_dict
+                    parent_ids = parent_indices[children_indices]
+
+                    parent_levels_of_children = levels[parent_ids]
+                    valid_children_mask = (
+                        (parent_ids >= 0)
+                        & (parent_ids < N)
+                        & (parent_levels_of_children == parent_level)
+                    )
+                    if not valid_children_mask.all():
+                        children_indices = children_indices[valid_children_mask]
+                        parent_ids = parent_ids[valid_children_mask]
                         if len(children_indices) == 0:
                             # Cache empty result
                             empty_children = torch.tensor([], dtype=torch.long, device=device)
                             empty_parents = torch.tensor([], dtype=torch.long, device=device)
-                            cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
+                            cache_for_direction[cache_key] = (empty_children, empty_parents)
                             return torch.tensor(0.0, device=device), empty_losses_dict
-                        
-                        # Get parent_ids for children
-                        parent_ids = parent_indices[children_indices]  # [K,] - parent index for each child
-                        
-                        # Filter: only keep children whose parents are at parent_level
-                        parent_levels_of_children = levels[parent_ids]  # [K,]
-                        valid_children_mask = (parent_ids >= 0) & (parent_ids < N) & (parent_levels_of_children == parent_level)
-                        if not valid_children_mask.all():
-                            children_indices = children_indices[valid_children_mask]
-                            parent_ids = parent_ids[valid_children_mask]
-                            if len(children_indices) == 0:
-                                # Cache empty result
-                                empty_children = torch.tensor([], dtype=torch.long, device=device)
-                                empty_parents = torch.tensor([], dtype=torch.long, device=device)
-                                cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                                return torch.tensor(0.0, device=device), empty_losses_dict
-                        
-                    else:  # upwards
-                        # Upwards: target_level (parents)와 target_level+1 (children) 이용
-                        # target_level의 gaussians가 parents, target_level+1의 gaussians가 children
-                        child_level = target_level + 1
-                        
-                        # Find gaussians at target_level and child_level
-                        child_level_mask = (levels == child_level)
-                        if not child_level_mask.any():
-                            # Cache empty result
-                            empty_children = torch.tensor([], dtype=torch.long, device=device)
-                            empty_parents = torch.tensor([], dtype=torch.long, device=device)
-                            cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                            return torch.tensor(0.0, device=device), empty_losses_dict
-                        
-                        # Children are at target_level+1
-                        children_mask = child_level_mask  # [N,]
-                        children_indices = torch.where(children_mask)[0]  # [K,] - children at target_level+1
+                else:  # upwards
+                    child_level = target_level + 1
+                    child_level_mask = levels == child_level
+                    if not child_level_mask.any():
+                        # Cache empty result
+                        empty_children = torch.tensor([], dtype=torch.long, device=device)
+                        empty_parents = torch.tensor([], dtype=torch.long, device=device)
+                        cache_for_direction[cache_key] = (empty_children, empty_parents)
+                        return torch.tensor(0.0, device=device), empty_losses_dict
+
+                    children_indices = torch.where(child_level_mask)[0]
+                    if len(children_indices) == 0:
+                        # Cache empty result
+                        empty_children = torch.tensor([], dtype=torch.long, device=device)
+                        empty_parents = torch.tensor([], dtype=torch.long, device=device)
+                        cache_for_direction[cache_key] = (empty_children, empty_parents)
+                        return torch.tensor(0.0, device=device), empty_losses_dict
+                    parent_ids = parent_indices[children_indices]
+
+                    parent_levels_of_children = levels[parent_ids]
+                    valid_children_mask = (
+                        (parent_ids >= 0)
+                        & (parent_ids < N)
+                        & (parent_levels_of_children == target_level)
+                    )
+                    if not valid_children_mask.all():
+                        children_indices = children_indices[valid_children_mask]
+                        parent_ids = parent_ids[valid_children_mask]
                         if len(children_indices) == 0:
                             # Cache empty result
                             empty_children = torch.tensor([], dtype=torch.long, device=device)
                             empty_parents = torch.tensor([], dtype=torch.long, device=device)
-                            cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
+                            cache_for_direction[cache_key] = (empty_children, empty_parents)
                             return torch.tensor(0.0, device=device), empty_losses_dict
-                        
-                        # Get parent_ids for children
-                        parent_ids = parent_indices[children_indices]  # [K,] - parent index for each child
-                        
-                        # Filter: only keep children whose parents are at target_level
-                        parent_levels_of_children = levels[parent_ids]  # [K,]
-                        valid_children_mask = (parent_ids >= 0) & (parent_ids < N) & (parent_levels_of_children == target_level)
-                        if not valid_children_mask.all():
-                            children_indices = children_indices[valid_children_mask]
-                            parent_ids = parent_ids[valid_children_mask]
-                            if len(children_indices) == 0:
-                                # Cache empty result
-                                empty_children = torch.tensor([], dtype=torch.long, device=device)
-                                empty_parents = torch.tensor([], dtype=torch.long, device=device)
-                                cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                                return torch.tensor(0.0, device=device), empty_losses_dict
-                    
-                    # Compute mappings for caching
-                    unique_parent_ids = torch.unique(parent_ids)  # [M,] where M <= K
-                    unique_parent_ids = unique_parent_ids[unique_parent_ids >= 0]  # Filter out -1
-                    if len(unique_parent_ids) == 0:
-                        # Cache empty result
-                        empty_children = torch.tensor([], dtype=torch.long, device=device)
-                        empty_parents = torch.tensor([], dtype=torch.long, device=device)
-                        cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                        return torch.tensor(0.0, device=device), empty_losses_dict
-                    
-                    max_parent_id = unique_parent_ids.max().item()
-                    parent_id_to_valid_idx = torch.full((max_parent_id + 1,), -1, dtype=torch.long, device=device)
-                    # Will be filled after weight computation
-                    valid_parent_ids = None
-                    mapped_parent_ids = None
-                    num_valid_parents = None
-        
+
         if profile_detail:
             torch.cuda.synchronize()
             t2 = time.time()
-            timings['index_compute'] = (t2 - t1) * 1000
+            timings["index_compute"] = (t2 - t1) * 1000
         
         # Validate provided indices (check cached empty result)
         if len(children_indices) == 0:
             return torch.tensor(0.0, device=device), empty_losses_dict
         
-        # CHANGED: Use individual parameters directly (no need for get_splats)
-        # Individual parameters are stored directly in self.splats
-        actual_splats = multigrid_gaussians.splats
-        
-        # COMMON: Extract children parameters (detach will be applied later based on direction)
-        children_means = actual_splats["means"][children_indices]  # [K, 3]
-        children_scales = actual_splats["scales"][children_indices]  # [K, 3]
-        children_quats = actual_splats["quats"][children_indices]  # [K, 4]
-        children_opacities = actual_splats["opacities"][children_indices]  # [K,]
-        children_sh0 = actual_splats["sh0"][children_indices]  # [K, 1, 3] - keep shape for consistency
-        
+        # Store cache if we computed it (not from cache)
+        if children_indices is not None and parent_ids is not None:
+            if cache_key not in cache_for_direction:
+                cache_for_direction[cache_key] = (children_indices, parent_ids)
+
+        current_proj = self._extract_projection_data(info_current)
+        other_proj = self._extract_projection_data(info_other)
+        if current_proj is None or other_proj is None:
+            return torch.tensor(0.0, device=device), empty_losses_dict
+
+        if direction == "downwards":
+            children_proj = current_proj
+            parent_proj = other_proj
+        else:
+            children_proj = other_proj
+            parent_proj = current_proj
+
+        child_index_map = children_proj["index_map"]
+        parent_index_map = parent_proj["index_map"]
+        child_local = child_index_map[children_indices]
+        parent_local = parent_index_map[parent_ids]
+        valid_mask = (child_local >= 0) & (parent_local >= 0)
+        if not valid_mask.any():
+            return torch.tensor(0.0, device=device), empty_losses_dict
+
+        child_local = child_local[valid_mask]
+        parent_local = parent_local[valid_mask]
+
+        child_means2d = children_proj["means2d"][child_local]  # [K, 2]
+        child_covars2d = children_proj["covars2d"][child_local]  # [K, 2, 2]
+        child_det_inv = children_proj["det_inv"][child_local]  # [K,]
+        child_opacities = children_proj["opacities"][child_local]  # [K,]
+        child_colors = children_proj["colors"][child_local]  # [K, D]
+
+        parent_means2d = parent_proj["means2d"]
+        parent_covars2d = parent_proj["covars2d"]
+        parent_opacities = parent_proj["opacities"]
+        parent_colors = parent_proj["colors"]
+
         if profile_detail:
             torch.cuda.synchronize()
             t3 = time.time()
-            timings['extract_children'] = (t3 - t2) * 1000
-        
-        # COMMON: Children -> Parent aggregation (same for both directions)
-        # Compute weights for aggregation using 2D projection (WITH gradients for one-hot regularization)
+            timings["extract_children"] = (t3 - t2) * 1000
+
+        # Compute weights using 2D covariances (gradient enabled)
         if profile_detail:
             torch.cuda.synchronize()
             t_weight_start = time.time()
-        
-        # Always compute children_scales_exp for 3D covariance calculation
-        children_scales_exp = torch.exp(children_scales).clamp_min(1e-6).clamp_max(1e6)  # [K, 3]
-        
-        if profile_detail:
-            torch.cuda.synchronize()
-            t_scale_exp = time.time()
-            timings['weight_scale_exp'] = (t_scale_exp - t_weight_start) * 1000
-        
-        # Extract 2D projection data for children
-        # downwards: children are at target_level, use info_current
-        # upwards: children are at target_level+1, use info_other
-        if direction == "downwards":
-            proj_data = self._extract_projection_data(info_current) if info_current is not None else None
-        else:  # upwards
-            proj_data = self._extract_projection_data(info_other) if info_other is not None else None
-        
-        if proj_data is not None:
-            # Use 2D projection data for weight calculation
-            index_map = proj_data["index_map"]  # [N,] maps gaussian index to projection data index
-            children_proj_indices = index_map[children_indices]  # [K,]
-            valid_proj_mask = children_proj_indices >= 0  # [K,]
-            
-            if valid_proj_mask.any():
-                # Get 2D covariance determinants for valid children
-                det_inv = proj_data["det_inv"]  # [N_proj,]
-                children_det_inv = det_inv[children_proj_indices[valid_proj_mask]]  # [K_valid,]
-                # 2D area = 1/sqrt(det_inv) = sqrt(det)
-                children_areas_2d = torch.rsqrt(children_det_inv.clamp_min(1e-12))  # [K_valid,]
-                
-                # Get opacities from projection data (already in linear space)
-                opacities_proj = proj_data["opacities"]  # [N_proj,]
-                children_opacities_proj = opacities_proj[children_proj_indices[valid_proj_mask]]  # [K_valid,]
-                
-                # Compute unnormalized weights: o * area_2d
-                unnormalized_weights_valid = children_opacities_proj * children_areas_2d  # [K_valid,]
-                
-                # Fill in weights for all children (invalid ones use 3D fallback)
-                unnormalized_weights = torch.zeros(len(children_indices), device=device, dtype=children_opacities.dtype)
-                unnormalized_weights[valid_proj_mask] = unnormalized_weights_valid
-                
-                # Fallback to 3D for invalid children
-                if not valid_proj_mask.all():
-                    scale_prod = children_scales_exp[~valid_proj_mask].prod(dim=-1).clamp_min(1e-12)  # [K_invalid,]
-                    children_covar_det_pow13 = torch.pow(scale_prod, 2.0 / 3.0)  # [K_invalid,]
-                    children_opacities_clamped = torch.sigmoid(children_opacities[~valid_proj_mask]).clamp_min(1e-8)  # [K_invalid,]
-                    unnormalized_weights[~valid_proj_mask] = children_opacities_clamped * children_covar_det_pow13
-            else:
-                # Fallback to 3D if no valid projection data
-                scale_prod = children_scales_exp.prod(dim=-1).clamp_min(1e-12)  # [K,]
-                children_covar_det_pow13 = torch.pow(scale_prod, 2.0 / 3.0)  # [K,] - (det)^(1/3) for 3D Gaussian
-                children_opacities_clamped = torch.sigmoid(children_opacities).clamp_min(1e-8)  # [K,]
-                unnormalized_weights = children_opacities_clamped * children_covar_det_pow13  # [K,]
-        else:
-            # Fallback to 3D if no projection data available
-            scale_prod = children_scales_exp.prod(dim=-1).clamp_min(1e-12)  # [K,]
-            children_covar_det_pow13 = torch.pow(scale_prod, 2.0 / 3.0)  # [K,] - (det)^(1/3) for 3D Gaussian
-            children_opacities_clamped = torch.sigmoid(children_opacities).clamp_min(1e-8)  # [K,]
-            unnormalized_weights = children_opacities_clamped * children_covar_det_pow13  # [K,]
-        
+
+        area = torch.rsqrt(child_det_inv.clamp_min(1e-12))
+        unnormalized_weights = child_opacities.clamp_min(1e-8) * area
+
         if profile_detail:
             torch.cuda.synchronize()
             t_weight_calc = time.time()
-            timings['weight_calc'] = (t_weight_calc - t_scale_exp) * 1000
-        
-        # OPTIMIZED: Use cached mappings if available, otherwise compute
-        if valid_parent_ids is None or mapped_parent_ids is None:
-            if profile_detail:
-                torch.cuda.synchronize()
-                t_mapping_start = time.time()
-            
-            # Need to compute mappings
-            unique_parent_ids = torch.unique(parent_ids)  # [M,] where M <= K
-            unique_parent_ids = unique_parent_ids[unique_parent_ids >= 0]  # Filter out -1
-            if len(unique_parent_ids) == 0:
-                return torch.tensor(0.0, device=device), empty_losses_dict
-            
-            if profile_detail:
-                torch.cuda.synchronize()
-                t_unique = time.time()
-                timings['weight_unique'] = (t_unique - t_mapping_start) * 1000
-            
-            # OPTIMIZED: Compute sum of weights per parent using scatter_add (vectorized)
-            # Only allocate for max(parent_ids) + 1 instead of full N
-            max_parent_id = unique_parent_ids.max().item()
-            parent_weight_sums = torch.zeros(max_parent_id + 1, device=device, dtype=unnormalized_weights.dtype)
-            parent_weight_sums.scatter_add_(0, parent_ids, unnormalized_weights)
-            
-            if profile_detail:
-                torch.cuda.synchronize()
-                t_weight_sum = time.time()
-                timings['weight_sum'] = (t_weight_sum - t_unique) * 1000
-            
-            # Filter out parents with no children (weight_sum = 0)
-            valid_parent_ids = unique_parent_ids[parent_weight_sums[unique_parent_ids] > 1e-8]
-            if len(valid_parent_ids) == 0:
-                return torch.tensor(0.0, device=device), empty_losses_dict
-            
-            num_valid_parents = len(valid_parent_ids)
-            
-            if profile_detail:
-                torch.cuda.synchronize()
-                t_filter = time.time()
-                timings['weight_filter'] = (t_filter - t_weight_sum) * 1000
-            
-            # OPTIMIZED: Create mapping from parent_id to index in valid_parent_indices
-            if parent_id_to_valid_idx is None or parent_id_to_valid_idx.shape[0] <= max_parent_id:
-                parent_id_to_valid_idx = torch.full((max_parent_id + 1,), -1, dtype=torch.long, device=device)
-            else:
-                parent_id_to_valid_idx.fill_(-1)
-            parent_id_to_valid_idx[valid_parent_ids] = torch.arange(num_valid_parents, device=device)
-            
-            # Map parent_ids to valid indices
-            valid_parent_ids_mask = parent_id_to_valid_idx[parent_ids] >= 0  # [K,]
-            if not valid_parent_ids_mask.all():
-                # Filter children to only those with valid parents
-                children_indices = children_indices[valid_parent_ids_mask]
-                parent_ids = parent_ids[valid_parent_ids_mask]
-                children_means = children_means[valid_parent_ids_mask]
-                children_scales = children_scales[valid_parent_ids_mask]
-                children_scales_exp = children_scales_exp[valid_parent_ids_mask]
-                children_quats = children_quats[valid_parent_ids_mask]
-                children_opacities = children_opacities[valid_parent_ids_mask]
-                children_sh0 = children_sh0[valid_parent_ids_mask]
-                unnormalized_weights = unnormalized_weights[valid_parent_ids_mask]
-                K = len(children_indices)
-                if K == 0:
-                    return torch.tensor(0.0, device=device), empty_losses_dict
-            
-            # Map parent_ids to valid indices (0..num_valid_parents-1)
-            mapped_parent_ids = parent_id_to_valid_idx[parent_ids]  # [K,]
-            
-            if profile_detail:
-                torch.cuda.synchronize()
-                t_mapping_end = time.time()
-                timings['weight_mapping'] = (t_mapping_end - t_filter) * 1000
-            
-            # Update cache with computed mappings
-            # Cache key includes max_level to invalidate when max_level changes
-            cache_for_direction[cache_key] = (children_indices, parent_ids, valid_parent_ids, parent_id_to_valid_idx, mapped_parent_ids)
-        else:
-            # Use cached mappings - need to compute parent_weight_sums for opacity calculation
-            num_valid_parents = len(valid_parent_ids)
-            max_parent_id = valid_parent_ids.max().item()
-            parent_weight_sums = torch.zeros(max_parent_id + 1, device=device, dtype=unnormalized_weights.dtype)
-            parent_weight_sums.scatter_add_(0, parent_ids, unnormalized_weights)
-        
-        # OPTIMIZED: Normalize weights per parent using precomputed sums
+            timings["weight_calc"] = (t_weight_calc - t_weight_start) * 1000
+
+        num_parents = parent_means2d.shape[0]
+        parent_weight_sums = torch.zeros(
+            num_parents, device=device, dtype=unnormalized_weights.dtype
+        )
+        parent_weight_sums.scatter_add_(0, parent_local, unnormalized_weights)
+
         if profile_detail:
             torch.cuda.synchronize()
-            t_normalize_start = time.time()
-        
-        parent_weight_sum_per_child = parent_weight_sums[parent_ids]  # [K,]
-        weights = unnormalized_weights / (parent_weight_sum_per_child + 1e-20)  # [K,]
-        
+            t_weight_sum = time.time()
+            timings["weight_sum"] = (t_weight_sum - t_weight_calc) * 1000
+
+        parent_weight_sum_per_child = parent_weight_sums[parent_local]
+        weights = unnormalized_weights / (parent_weight_sum_per_child + 1e-20)
+
         if profile_detail:
             torch.cuda.synchronize()
             t_weight_end = time.time()
-            timings['weight_normalize'] = (t_weight_end - t_normalize_start) * 1000
-            if 'weight_compute' not in timings:
-                timings['weight_compute'] = (t_weight_end - t_weight_start) * 1000
-        
-        # Compute children's covariance matrices after filtering
-        children_covars, _ = quat_scale_to_covar_preci(
-            quats=children_quats,
-            scales=children_scales_exp,
-            compute_covar=True,
-            compute_preci=False,
-            triu=False,
-        )  # [K, 3, 3]
-        
-        if profile_detail:
-            torch.cuda.synchronize()
-            t5 = time.time()
-            timings['children_covar'] = (t5 - t_weight_end) * 1000
-            
-        # OPTIMIZED: Use num_valid_parents-sized tensors instead of N-sized
+            timings["weight_normalize"] = (t_weight_end - t_weight_sum) * 1000
+            timings["weight_compute"] = (t_weight_end - t_weight_start) * 1000
+
         # Aggregate children to get expected parent parameters
         if profile_detail:
             torch.cuda.synchronize()
             t_agg_start = time.time()
-        
-        expected_means = torch.zeros(num_valid_parents, 3, device=device, dtype=children_means.dtype)
-        expected_covars = torch.zeros(num_valid_parents, 3, 3, device=device, dtype=children_covars.dtype)
-        expected_opacities = torch.zeros(num_valid_parents, device=device, dtype=children_opacities.dtype)
-        expected_sh0 = torch.zeros(num_valid_parents, 1, 3, device=device, dtype=children_sh0.dtype)
-        
-        # Mean: μ^(l+1) = Σ w_i^(l) μ_i^(l) (Equation 3)
-        # weights are already normalized per parent: sum(weights for parent p) = 1
-        # So scatter_add(weighted_means) gives the correct weighted average
-        weighted_means = children_means * weights.unsqueeze(-1)  # [K, 3]
-        expected_means.scatter_add_(0, mapped_parent_ids.unsqueeze(-1).expand(-1, 3), weighted_means)
-        
+
+        expected_means2d = torch.zeros(
+            num_parents, 2, device=device, dtype=child_means2d.dtype
+        )
+        weighted_means2d = child_means2d * weights.unsqueeze(-1)
+        expected_means2d.scatter_add_(
+            0, parent_local.unsqueeze(-1).expand(-1, 2), weighted_means2d
+        )
+
         if profile_detail:
             torch.cuda.synchronize()
             t_means = time.time()
-            timings['agg_means'] = (t_means - t_agg_start) * 1000
-        
-        # Covariance: Σ^(l+1) = Σ w_i^(l) (Σ_i^(l) + (μ_i^(l) - μ^(l+1)) (μ_i^(l) - μ^(l+1))^T) (Equation 4)
-        # Get parent means per child (after scatter_add is complete)
-        parent_means_per_child = expected_means[mapped_parent_ids]  # [K, 3]
-        
-        mean_diffs = children_means - parent_means_per_child  # [K, 3]
+            timings["agg_means"] = (t_means - t_agg_start) * 1000
+
+        parent_means_per_child = expected_means2d[parent_local]
+        mean_diffs = child_means2d - parent_means_per_child  # [K, 2]
         mean_diff_outer = torch.bmm(
             mean_diffs.unsqueeze(2), mean_diffs.unsqueeze(1)
-        )  # [K, 3, 3]
-        
+        )  # [K, 2, 2]
+
         if profile_detail:
             torch.cuda.synchronize()
             t_mean_diff = time.time()
-            timings['agg_mean_diff'] = (t_mean_diff - t_means) * 1000
-        
-        children_covars_with_mean_diff = children_covars + mean_diff_outer  # [K, 3, 3]
-        weighted_covars = children_covars_with_mean_diff * weights.view(-1, 1, 1)  # [K, 3, 3]
-        
-        # OPTIMIZED: Flatten covars and concat with sh0 for unified scatter_add (means already computed)
-        # covars: [K, 9] (flattened), sh0: [K, 3]
-        # Total: [K, 12] (covars 9 + sh0 3)
-        weighted_covars_flat = weighted_covars.flatten(start_dim=1)  # [K, 9]
-        weighted_sh0_flat = children_sh0.squeeze(1) * weights.unsqueeze(-1)  # [K, 3] (sh0 is [K, 1, 3])
-        
-        # Concat: [K, 9+3] = [K, 12] (means already computed separately)
-        weighted_params_concat = torch.cat([weighted_covars_flat, weighted_sh0_flat], dim=1)  # [K, 12]
-        
-        # Unified scatter_add for covars and sh0 (means already done)
-        expected_params_concat = torch.zeros(num_valid_parents, 12, device=device, dtype=weighted_params_concat.dtype)
-        expected_params_concat.scatter_add_(0, mapped_parent_ids.unsqueeze(-1).expand(-1, 12), weighted_params_concat)
-        
-        # Split back
-        expected_covars_flat = expected_params_concat[:, :9]  # [num_valid_parents, 9]
-        expected_sh0_flat = expected_params_concat[:, 9:12]  # [num_valid_parents, 3]
-        expected_covars = expected_covars_flat.reshape(num_valid_parents, 3, 3)  # [num_valid_parents, 3, 3]
-        expected_sh0 = expected_sh0_flat.unsqueeze(1)  # [num_valid_parents, 1, 3]
-        
+            timings["agg_mean_diff"] = (t_mean_diff - t_means) * 1000
+
+        children_covars_with_mean_diff = child_covars2d + mean_diff_outer
+        weighted_covars = children_covars_with_mean_diff * weights.view(-1, 1, 1)
+        expected_covars2d = torch.zeros(
+            num_parents, 2, 2, device=device, dtype=child_covars2d.dtype
+        )
+        expected_covars2d.scatter_add_(
+            0, parent_local.view(-1, 1, 1).expand(-1, 2, 2), weighted_covars
+        )
+        expected_covars2d = (
+            expected_covars2d + expected_covars2d.transpose(-2, -1)
+        ) / 2.0
+
+        color_dim = child_colors.shape[-1]
+        expected_colors = torch.zeros(
+            num_parents, color_dim, device=device, dtype=child_colors.dtype
+        )
+        weighted_colors = child_colors * weights.unsqueeze(-1)
+        expected_colors.scatter_add_(
+            0, parent_local.unsqueeze(-1).expand(-1, color_dim), weighted_colors
+        )
+
         if profile_detail:
             torch.cuda.synchronize()
             t_scatter = time.time()
-            timings['agg_scatter'] = (t_scatter - t_mean_diff) * 1000
-        
-        # Make symmetric (covariance matrices must be symmetric)
-        expected_covars = (expected_covars + expected_covars.transpose(-2, -1)) / 2.0
-        
-        # Opacity: Use build_hierarchy.py method - falloff = (∑_i w'_i) / S_p
+            timings["agg_scatter"] = (t_scatter - t_mean_diff) * 1000
+
+        expected_covar_dets = torch.det(expected_covars2d).clamp_min(1e-12)
+        expected_surface_areas = torch.sqrt(expected_covar_dets).clamp_min(1e-12)
+        falloff = parent_weight_sums / expected_surface_areas
         # Convert falloff to opacity in linear space: o = falloff / (1 + falloff)
         # This is more stable than log space for loss computation
-        # OPTIMIZED: Reuse parent_weight_sums instead of recomputing
-        parent_unnormalized_weight_sums = parent_weight_sums[valid_parent_ids]  # [num_valid_parents,]
-        
-        # Compute merged surface area per parent using 2D projection
-        # downwards: parents are at target_level-1, use info_other
-        # upwards: parents are at target_level, use info_current
-        if direction == "downwards":
-            parent_proj_data = self._extract_projection_data(info_other) if info_other is not None else None
-        else:  # upwards
-            parent_proj_data = self._extract_projection_data(info_current) if info_current is not None else None
-        
-        if parent_proj_data is not None:
-            # Use 2D projection data for parent surface area
-            index_map = parent_proj_data["index_map"]  # [N,]
-            parent_proj_indices = index_map[valid_parent_ids]  # [num_valid_parents,]
-            valid_parent_proj_mask = parent_proj_indices >= 0  # [num_valid_parents,]
-            
-            if valid_parent_proj_mask.any():
-                # Get 2D covariance determinants for valid parents
-                det_inv = parent_proj_data["det_inv"]  # [N_proj,]
-                parent_det_inv = det_inv[parent_proj_indices[valid_parent_proj_mask]]  # [num_valid_parents_valid,]
-                # 2D area = 1/sqrt(det_inv) = sqrt(det)
-                parent_areas_2d_valid = torch.rsqrt(parent_det_inv.clamp_min(1e-12))  # [num_valid_parents_valid,]
-                
-                # Fill in areas for all parents (invalid ones use 3D fallback)
-                expected_surface_areas = torch.zeros(num_valid_parents, device=device, dtype=parent_unnormalized_weight_sums.dtype)
-                expected_surface_areas[valid_parent_proj_mask] = parent_areas_2d_valid
-                
-                # For invalid parents, fallback to 3D
-                if not valid_parent_proj_mask.all():
-                    expected_covar_dets_3d = torch.det(expected_covars[~valid_parent_proj_mask]).clamp_min(1e-8)  # [num_invalid,]
-                    expected_surface_areas_3d = torch.pow(expected_covar_dets_3d, 1.0/3.0)  # [num_invalid,]
-                    expected_surface_areas[~valid_parent_proj_mask] = expected_surface_areas_3d
-            else:
-                # Fallback to 3D if no valid projection data
-                expected_covar_dets = torch.det(expected_covars).clamp_min(1e-8)  # [num_valid_parents,]
-                expected_surface_areas = torch.pow(expected_covar_dets, 1.0/3.0)  # [num_valid_parents,]
-        else:
-            # Fallback to 3D if no projection data available
-            expected_covar_dets = torch.det(expected_covars).clamp_min(1e-8)  # [num_valid_parents,]
-            expected_surface_areas = torch.pow(expected_covar_dets, 1.0/3.0)  # [num_valid_parents,]
-        
-        # Falloff = (∑_i w'_i) / S_p per parent
-        falloff = parent_unnormalized_weight_sums / expected_surface_areas.clamp_min(1e-12)  # [num_valid_parents,]
-        # Convert falloff to opacity in linear space: o = falloff / (1 + falloff)
-        # This is more stable than log space for loss computation
-        expected_opacities_linear = falloff / (falloff + 1.0)  # [num_valid_parents,]
-        
+        expected_opacities_linear = falloff / (falloff + 1.0)
+
+        valid_parent_mask = parent_weight_sums > 1e-8
+        if not valid_parent_mask.any():
+            return torch.tensor(0.0, device=device), empty_losses_dict
+
+        expected_means2d = expected_means2d[valid_parent_mask]
+        expected_covars2d = expected_covars2d[valid_parent_mask]
+        expected_opacities_linear = expected_opacities_linear[valid_parent_mask]
+        expected_colors = expected_colors[valid_parent_mask]
+
+        parent_means2d = parent_means2d[valid_parent_mask]
+        parent_covars2d = parent_covars2d[valid_parent_mask]
+        # parent_opacities is already in linear space (from projection data, already sigmoid applied)
+        parent_opacities_linear = parent_opacities[valid_parent_mask]
+        parent_colors = parent_colors[valid_parent_mask]
+
         if profile_detail:
             torch.cuda.synchronize()
             t_agg_end = time.time()
-            timings['agg_opacity'] = (t_agg_end - t_scatter) * 1000
-            timings['aggregation'] = (t_agg_end - t_agg_start) * 1000
-        
-        # COMMON: Extract parent parameters for valid parents only
-        parent_means_actual = actual_splats["means"][valid_parent_ids]  # [num_valid_parents, 3]
-        parent_scales_actual = actual_splats["scales"][valid_parent_ids]  # [num_valid_parents, 3]
-        parent_quats_actual = actual_splats["quats"][valid_parent_ids]  # [num_valid_parents, 4]
-        parent_opacities_actual = actual_splats["opacities"][valid_parent_ids]  # [num_valid_parents,] (log space)
-        parent_sh0_actual = actual_splats["sh0"][valid_parent_ids]  # [num_valid_parents, 1, 3]
-        
-        # Convert parent opacities to linear space for loss computation
-        parent_opacities_linear_actual = torch.sigmoid(parent_opacities_actual)  # [num_valid_parents,] (linear space)
-        
-        if profile_detail:
-            torch.cuda.synchronize()
-            t7 = time.time()
-            timings['extract_parent'] = (t7 - t_agg_end) * 1000
-        
-        # COMMON: Expected values are already in num_valid_parents size
-        expected_means_parents = expected_means  # [num_valid_parents, 3]
-        expected_covars_parents = expected_covars  # [num_valid_parents, 3, 3]
-        expected_opacities_linear_parents = expected_opacities_linear  # [num_valid_parents,] (linear space)
-        expected_sh0_parents = expected_sh0  # [num_valid_parents, 1, 3]
+            timings["agg_opacity"] = (t_agg_end - t_scatter) * 1000
+            timings["aggregation"] = (t_agg_end - t_agg_start) * 1000
+            timings["extract_parent"] = (t_agg_end - t_scatter) * 1000
 
-        # COMMON: Compute parent's actual covariance matrices
-        parent_scales_exp = torch.exp(parent_scales_actual).clamp_min(1e-6).clamp_max(1e6)
-        parent_covars_actual, _ = quat_scale_to_covar_preci(
-            quats=parent_quats_actual,
-            scales=parent_scales_exp,
-            compute_covar=True,
-            compute_preci=False,
-            triu=False,
-        )  # [num_valid_parents, 3, 3]
-        
-        if profile_detail:
-            torch.cuda.synchronize()
-            t8 = time.time()
-            timings['parent_covar'] = (t8 - t7) * 1000
-        
-        # DIFFERENT: Apply detach based on direction (only difference between downwards/upwards)
+        # Apply detach based on direction
         # IMPORTANT: Gradient flow analysis:
-        # - downwards: expected is computed from children (children -> expected), so expected has gradients from children.
+        # - downwards: expected is computed from children's 2D projections (children -> expected), so expected has gradients from children.
         #   We detach expected to prevent gradients from flowing back to children, so only parent receives gradients.
-        # - upwards: expected is computed from children (children -> expected), so expected has gradients from children.
+        # - upwards: expected is computed from children's 2D projections (children -> expected), so expected has gradients from children.
         #   We detach parent to prevent gradients from flowing to parent, so only children (via expected) receive gradients.
+        # Note: In v2, children_proj and parent_proj come from rasterization, which is differentiable.
+        # The gradient flows: children 3D params -> children 2D proj -> expected -> loss (downwards: parent, upwards: children)
         if direction == "downwards":
             # Downwards: expected.detach() prevents gradients from flowing back to children
             # Only parent receives gradients (parent is updated to match expected from children)
-            expected_means_parents = expected_means_parents.detach()
-            expected_covars_parents = expected_covars_parents.detach()
-            expected_opacities_linear_parents = expected_opacities_linear_parents.detach()
-            expected_sh0_parents = expected_sh0_parents.detach()
+            expected_means2d = expected_means2d.detach()
+            expected_covars2d = expected_covars2d.detach()
+            expected_opacities_linear = expected_opacities_linear.detach()
+            expected_colors = expected_colors.detach()
         else:  # upwards
             # Upwards: parent.detach() prevents gradients from flowing to parent
             # Only children (via expected) receive gradients (children are updated to match expected from parent)
-            parent_means_actual = parent_means_actual.detach()
-            parent_covars_actual = parent_covars_actual.detach()
-            parent_opacities_linear_actual = parent_opacities_linear_actual.detach()
-            parent_sh0_actual = parent_sh0_actual.detach()
+            parent_means2d = parent_means2d.detach()
+            parent_covars2d = parent_covars2d.detach()
+            parent_opacities_linear = parent_opacities_linear.detach()
+            parent_colors = parent_colors.detach()
+
+        mean_loss = F.mse_loss(expected_means2d, parent_means2d)
         
-        # COMMON: Compute losses: expected (from children) vs actual (parent)
-        # Note: shN loss is excluded as requested
-        mean_loss = F.mse_loss(expected_means_parents, parent_means_actual)
-        covar_diff = expected_covars_parents - parent_covars_actual
-        covar_loss = (covar_diff ** 2).sum(dim=(1, 2)).mean()
+        # Normalize covariance loss by Frobenius norm to prevent explosion
+        # Use relative error: ||expected - parent||_F / (||expected||_F + ||parent||_F + eps)
+        expected_covar_norm = expected_covars2d.norm(dim=(1, 2))  # [num_valid_parents,]
+        parent_covar_norm = parent_covars2d.norm(dim=(1, 2))  # [num_valid_parents,]
+        covar_diff_norm = (expected_covars2d - parent_covars2d).norm(dim=(1, 2))  # [num_valid_parents,]
+        # Normalize by average norm to get relative error
+        avg_covar_norm = (expected_covar_norm + parent_covar_norm) / 2.0 + 1e-6
+        covar_loss = (covar_diff_norm / avg_covar_norm).mean()
+        
         # Compare opacities in linear space (more stable than log space)
-        opacity_loss = F.mse_loss(expected_opacities_linear_parents, parent_opacities_linear_actual)
-        sh0_loss = F.mse_loss(expected_sh0_parents, parent_sh0_actual)
-        shN_loss = torch.tensor(0.0, device=device)  # Excluded from loss computation
-        
-        # Weight one-hot regularization: minimize entropy to encourage sparse weights
-        # For each parent, compute entropy of its children's weights
-        # Lower entropy = more one-hot like (one child dominates)
-        weight_onehot_loss = torch.tensor(0.0, device=device)
-        if cfg.weight_onehot_lambda > 0.0:
-            # VECTORIZED: Compute entropy for all parents at once
-            # weights: [K,], mapped_parent_ids: [K,] where each value is in [0, num_valid_parents-1]
-            # Entropy for parent p: -sum(w_i * log(w_i + eps)) where mapped_parent_ids[i] == p
-            
-            eps = 1e-10
-            # Compute w * log(w + eps) for all weights: [K,]
-            weight_log_weights = weights * torch.log(weights + eps)  # [K,]
-            
-            # Sum per parent using scatter_add: [num_valid_parents,]
-            parent_entropies = torch.zeros(num_valid_parents, device=device, dtype=weights.dtype)
-            parent_entropies.scatter_add_(0, mapped_parent_ids, weight_log_weights)
-            parent_entropies = -parent_entropies  # Negate to get entropy
-            
-            # Count number of children per parent: [num_valid_parents,]
-            parent_child_counts = torch.zeros(num_valid_parents, device=device, dtype=torch.long)
-            parent_child_counts.scatter_add_(0, mapped_parent_ids, torch.ones_like(mapped_parent_ids))
-            
-            # Only consider parents with multiple children (entropy is 0 for single child)
-            # Filter: keep only parents with parent_child_counts > 1
-            multi_child_mask = parent_child_counts > 1
-            if multi_child_mask.any():
-                # Average entropy across parents with multiple children
-                weight_onehot_loss = parent_entropies[multi_child_mask].mean()
-        
-        hierarchy_loss = mean_loss + covar_loss + opacity_loss + sh0_loss + cfg.weight_onehot_lambda * weight_onehot_loss
-        
+        opacity_loss = F.mse_loss(expected_opacities_linear, parent_opacities_linear)
+        color_loss = F.mse_loss(expected_colors, parent_colors)
+        shN_loss = torch.tensor(0.0, device=device)
+
+        hierarchy_loss = mean_loss + covar_loss + opacity_loss + color_loss
+
         if profile_detail:
             torch.cuda.synchronize()
             t9 = time.time()
-            timings['loss_compute'] = (t9 - t8) * 1000
-            timings['total'] = (t9 - t0) * 1000
-            
-            # Store timings for periodic reporting
-            if not hasattr(self, '_consistency_timings'):
+            timings["loss_compute"] = (t9 - t_agg_end) * 1000
+            timings["total"] = (t9 - t0) * 1000
+
+            if not hasattr(self, "_consistency_timings"):
                 self._consistency_timings = []
             self._consistency_timings.append(timings)
-            
-            # Print detailed breakdown every 100 steps
+
             if len(self._consistency_timings) % 100 == 0:
-                # Average over last 100 steps
                 avg_timings = {}
                 for key in timings.keys():
-                    avg_timings[key] = np.mean([t[key] for t in self._consistency_timings[-100:]])
-                
+                    avg_timings[key] = np.mean(
+                        [t[key] for t in self._consistency_timings[-100:]]
+                    )
                 print(f"[Consistency Loss Profile] Step {len(self._consistency_timings)}:")
                 print(f"  Init: {avg_timings.get('init', 0):.2f}ms")
                 print(f"  Index compute: {avg_timings.get('index_compute', 0):.2f}ms")
                 print(f"  Extract children: {avg_timings.get('extract_children', 0):.2f}ms")
                 print(f"  Weight compute (total): {avg_timings.get('weight_compute', 0):.2f}ms")
-                if 'weight_scale_exp' in avg_timings:
-                    print(f"    - scale_exp: {avg_timings.get('weight_scale_exp', 0):.2f}ms")
+                if 'weight_calc' in avg_timings:
                     print(f"    - weight_calc: {avg_timings.get('weight_calc', 0):.2f}ms")
-                    print(f"    - unique: {avg_timings.get('weight_unique', 0):.2f}ms")
                     print(f"    - weight_sum: {avg_timings.get('weight_sum', 0):.2f}ms")
-                    print(f"    - filter: {avg_timings.get('weight_filter', 0):.2f}ms")
-                    print(f"    - mapping: {avg_timings.get('weight_mapping', 0):.2f}ms")
                     print(f"    - normalize: {avg_timings.get('weight_normalize', 0):.2f}ms")
-                print(f"  Children covar: {avg_timings.get('children_covar', 0):.2f}ms")
                 print(f"  Aggregation (total): {avg_timings.get('aggregation', 0):.2f}ms")
                 if 'agg_means' in avg_timings:
                     print(f"    - means: {avg_timings.get('agg_means', 0):.2f}ms")
                     print(f"    - mean_diff: {avg_timings.get('agg_mean_diff', 0):.2f}ms")
-                    print(f"    - scatter (unified): {avg_timings.get('agg_scatter', 0):.2f}ms")
+                    print(f"    - scatter: {avg_timings.get('agg_scatter', 0):.2f}ms")
                     print(f"    - opacity: {avg_timings.get('agg_opacity', 0):.2f}ms")
-                print(f"  Extract parent: {avg_timings.get('extract_parent', 0):.2f}ms")
-                print(f"  Parent covar: {avg_timings.get('parent_covar', 0):.2f}ms")
                 print(f"  Loss compute: {avg_timings.get('loss_compute', 0):.2f}ms")
                 print(f"  Total: {avg_timings.get('total', 0):.2f}ms")
-                print(f"  K={len(children_indices)}, M={num_valid_parents}")
-        
+                print(f"  K={len(child_local)}, M={valid_parent_mask.sum().item()}")
+
         losses_dict = {
             "m": mean_loss,
             "c": covar_loss,
             "o": opacity_loss,
-            "s0": sh0_loss,
+            "s0": color_loss,
             "sN": shN_loss,
-            "w_onehot": weight_onehot_loss,
+            # Debug info for covariance scales
+            "expected_covar_norm": expected_covar_norm.mean(),
+            "parent_covar_norm": parent_covar_norm.mean(),
+            "covar_diff_norm": covar_diff_norm.mean(),
         }
-
 
         return hierarchy_loss, losses_dict
 
@@ -2910,6 +2601,14 @@ class Runner:
         # Update pixels to use downsampled version for loss calculation
         pixels = pixels_downsampled
         height, width = pixels.shape[1:3]
+        
+        # Projection intrinsics for current resolution (used for extra projection pass)
+        Ks_render = Ks_original.clone()
+        if downsample_factor > 1:
+            Ks_render[:, 0, 0] = Ks_original[:, 0, 0] / downsample_factor  # fx
+            Ks_render[:, 1, 1] = Ks_original[:, 1, 1] / downsample_factor  # fy
+            Ks_render[:, 0, 2] = Ks_original[:, 0, 2] / downsample_factor  # cx
+            Ks_render[:, 1, 2] = Ks_original[:, 1, 2] / downsample_factor  # cy
 
         if cfg.use_bilateral_grid:
             grid_y, grid_x = torch.meshgrid(
@@ -2995,77 +2694,60 @@ class Runner:
         #   * parents are detached (gradient cut), children receive gradients
         # Note: children_indices and parent_ids are None here (will be computed inside).
         # For vcycle_trainer_v21.py, these can be precomputed and cached when hierarchy structure changes.
+        # For hierarchy_trainer_vcycle_v2.py, projection data (info_current, info_other) is passed from _train_step.
         losses_dict = {}
         if cfg.hierarchy_consistency_lambda > 0.0 and direction is not None:
+            # Render projection data for the adjacent level
+            info_other = None
+            other_level = None
+            if direction == "downwards":
+                other_level = target_level - 1
+            else:  # upwards
+                # No max_level check - rely on parent/children existence check in consistency loss
+                other_level = target_level + 1
+            
+            if other_level is not None and other_level >= 1:
+                # Use projection-only function instead of full rasterization for efficiency
+                proj_data_other = self._get_projection_only(
+                    level=other_level,
+                    camtoworlds=camtoworlds,
+                    Ks=Ks_render,
+                    width=width,
+                    height=height,
+                    sh_degree=sh_degree_to_use,
+                    near_plane=cfg.near_plane,
+                    far_plane=cfg.far_plane,
+                    image_ids=image_ids,
+                )
+                # Convert projection data to info format for compatibility
+                if proj_data_other is not None:
+                    # Create a mock info dict with projection data
+                    # Note: This is not a full rasterization info, just projection data
+                    info_other = {
+                        "means2d": proj_data_other["means2d"],
+                        "conics": None,  # Will be computed from covars2d if needed
+                        "opacities": proj_data_other["opacities"],
+                        "colors": proj_data_other["colors"],
+                        "radii": None,  # Not needed for consistency loss
+                        "visible_mask": None,  # Not needed for consistency loss
+                        "gaussian_ids": None,  # Not needed for consistency loss
+                        "render_level": proj_data_other["render_level"],
+                        "projection_data": proj_data_other,  # Store full projection data
+                    }
+                else:
+                    info_other = None
+
             # Profile consistency loss time (optional, controlled by cfg)
             if hasattr(cfg, 'profile_timing') and cfg.profile_timing:
                 torch.cuda.synchronize()
                 consistency_start = time.time()
             
-            # Get projection data for other level (parent/child level)
-            info_other = None
-            if direction == "downwards":
-                # downwards: children = target_level (info_current), parent = target_level-1 (info_other)
-                other_level = target_level - 1
-                if other_level >= 1:
-                    # Calculate resolution for other level
-                    other_level_diff = image_multigrid_max_level - other_level
-                    other_downsample_factor = (1.0 / cfg.level_resolution_factor) ** other_level_diff
-                    other_downsample_factor = max(1, int(other_downsample_factor))
-                    other_height = max(1, int(original_height // other_downsample_factor))
-                    other_width = max(1, int(original_width // other_downsample_factor))
-                    other_Ks = Ks_original.clone()
-                    if other_downsample_factor > 1:
-                        other_Ks[:, 0, 0] = Ks_original[:, 0, 0] / other_downsample_factor
-                        other_Ks[:, 1, 1] = Ks_original[:, 1, 1] / other_downsample_factor
-                        other_Ks[:, 0, 2] = Ks_original[:, 0, 2] / other_downsample_factor
-                        other_Ks[:, 1, 2] = Ks_original[:, 1, 2] / other_downsample_factor
-                    info_other = self._get_projection_only(
-                        level=other_level,
-                        camtoworlds=camtoworlds,
-                        Ks=other_Ks,
-                        width=other_width,
-                        height=other_height,
-                        sh_degree=sh_degree_to_use,
-                        near_plane=cfg.near_plane,
-                        far_plane=cfg.far_plane,
-                        image_ids=image_ids,
-                    )
-            else:  # upwards
-                # upwards: children = target_level+1 (info_other), parent = target_level (info_current)
-                # No max_level check - rely on parent/children existence check in consistency loss
-                other_level = target_level + 1
-                if True:  # Always try to get projection data, let consistency loss handle existence check
-                    # Calculate resolution for other level
-                    other_level_diff = image_multigrid_max_level - other_level
-                    other_downsample_factor = (1.0 / cfg.level_resolution_factor) ** other_level_diff
-                    other_downsample_factor = max(1, int(other_downsample_factor))
-                    other_height = max(1, int(original_height // other_downsample_factor))
-                    other_width = max(1, int(original_width // other_downsample_factor))
-                    other_Ks = Ks_original.clone()
-                    if other_downsample_factor > 1:
-                        other_Ks[:, 0, 0] = Ks_original[:, 0, 0] / other_downsample_factor
-                        other_Ks[:, 1, 1] = Ks_original[:, 1, 1] / other_downsample_factor
-                        other_Ks[:, 0, 2] = Ks_original[:, 0, 2] / other_downsample_factor
-                        other_Ks[:, 1, 2] = Ks_original[:, 1, 2] / other_downsample_factor
-                    info_other = self._get_projection_only(
-                        level=other_level,
-                        camtoworlds=camtoworlds,
-                        Ks=other_Ks,
-                        width=other_width,
-                        height=other_height,
-                        sh_degree=sh_degree_to_use,
-                        near_plane=cfg.near_plane,
-                        far_plane=cfg.far_plane,
-                        image_ids=image_ids,
-                    )
-            
             hierarchy_loss, losses_dict = self._compute_hierarchy_consistency_loss(
                 target_level=target_level,
                 image_multigrid_max_level=image_multigrid_max_level,
                 direction=direction,
-                info_current=info,  # Target level rasterization info
-                info_other=info_other,  # Parent/child level projection data
+                info_current=info,
+                info_other=info_other,
                 children_indices=None,  # Will be computed inside (hierarchy structure is fixed here)
                 parent_ids=None,  # Will be computed inside (hierarchy structure is fixed here)
             )
@@ -3087,7 +2769,7 @@ class Runner:
             loss = loss + cfg.hierarchy_consistency_lambda * hierarchy_loss
             
             # Debug: Print detailed loss breakdown
-            if step % 10 == 0:  # Print every 10 steps
+            if step % 100 == 0:  # Print every 10 steps
                 print(f"[Loss Debug] Step {step} | direction={direction} | level={target_level}")
                 print(f"  Main loss: {loss.item():.6f}")
                 print(f"  L1 loss: {l1loss.item():.6f}")
@@ -3098,13 +2780,17 @@ class Runner:
                     print(f"    - mean_loss: {losses_dict.get('m', torch.tensor(0.0)).item():.6f}")
                     print(f"    - covar_loss: {losses_dict.get('c', torch.tensor(0.0)).item():.6f}")
                     print(f"    - opacity_loss: {losses_dict.get('o', torch.tensor(0.0)).item():.6f}")
-                    print(f"    - sh0_loss: {losses_dict.get('s0', torch.tensor(0.0)).item():.6f}")
+                    print(f"    - color_loss: {losses_dict.get('s0', torch.tensor(0.0)).item():.6f}")
                     print(f"    - shN_loss: {losses_dict.get('sN', torch.tensor(0.0)).item():.6f}")
-                    print(f"    - weight_onehot_loss: {losses_dict.get('w_onehot', torch.tensor(0.0)).item():.6f}")
+                    # Additional debug: check covariance scales
+                    if 'expected_covar_norm' in losses_dict:
+                        print(f"    - expected_covar_norm (avg): {losses_dict['expected_covar_norm'].item():.6f}")
+                        print(f"    - parent_covar_norm (avg): {losses_dict['parent_covar_norm'].item():.6f}")
+                        print(f"    - covar_diff_norm (avg): {losses_dict['covar_diff_norm'].item():.6f}")
 
         # Gradient scaling hooks are registered via _update_grad_scaling_hooks()
         # which is called after densification. Since densification is disabled
-        # in hierarchy_trainer_vcycle.py, hooks are never registered.
+        # in hierarchy_trainer_vcycle_v2.py, hooks are never registered.
         # For vcycle_trainer_v21.py, hooks are updated after densification.
 
         loss.backward()
@@ -3848,22 +3534,8 @@ class Runner:
             # Calculate finest level num_GS (rendered GS count) for direct comparison with baseline
             if len(self.multigrid_gaussians.levels) > 0:
                 highest_level = int(self.multigrid_gaussians.levels.max().item())
-                # Count gaussians at each level (for debugging)
-                levels = self.multigrid_gaussians.levels
-                unique_levels = sorted(levels.unique().cpu().tolist())
-                level_counts = {l: (levels == l).sum().item() for l in unique_levels}
-                num_GS_at_finest_level = level_counts.get(highest_level, 0)
-                # Set visible mask and count visible gaussians
                 self.multigrid_gaussians.set_visible_mask(highest_level)
                 num_GS_finest = self.multigrid_gaussians.visible_mask.sum().item()
-                # Debug: Check if masking is working correctly
-                if num_GS_finest == len(self.splats["means"]) and num_GS_at_finest_level < len(self.splats["means"]):
-                    # This means all gaussians are visible, but not all are at finest level
-                    # This suggests masking might not be working correctly
-                    print(f"[DEBUG] Step {step}: num_GS_total={len(self.splats['means'])}, "
-                          f"num_GS_at_finest_level={num_GS_at_finest_level}, "
-                          f"num_GS_visible={num_GS_finest}, highest_level={highest_level}")
-                    print(f"[DEBUG] Level counts: {level_counts}")
             else:
                 num_GS_finest = len(self.splats["means"])
             
@@ -4374,10 +4046,10 @@ if __name__ == "__main__":
 
     ```bash
     # Single GPU training
-    CUDA_VISIBLE_DEVICES=9 python vcycle_trainer.py --dataset_type nerf --data_dir /path/to/data
+    CUDA_VISIBLE_DEVICES=9 python hierarchy_trainer_vcycle_v2.py --dataset_type nerf --data_dir /path/to/data
 
     # Distributed training on 4 GPUs: Effectively 4x batch size so run 4x less steps.
-    CUDA_VISIBLE_DEVICES=0,1,2,3 python vcycle_trainer.py --dataset_type nerf --data_dir /path/to/data --steps_scaler 0.25
+    CUDA_VISIBLE_DEVICES=0,1,2,3 python hierarchy_trainer_vcycle_v2.py --dataset_type nerf --data_dir /path/to/data --steps_scaler 0.25
 
     ```
     """

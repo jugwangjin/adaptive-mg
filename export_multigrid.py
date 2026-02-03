@@ -13,7 +13,7 @@ import torch
 from torch import Tensor
 
 from gsplat import export_splats
-from multigrid_gaussians import MultigridGaussians
+from multigrid_gaussians_v8 import MultigridGaussians
 
 
 def export_multigrid_splats(

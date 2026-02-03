@@ -34,18 +34,14 @@ from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_rand
 
 from gsplat import export_splats
 from gsplat.compression import PngCompression
-from gsplat.cuda._wrapper import quat_scale_to_covar_preci
 from gsplat.distributed import cli
 from gsplat.optimizers import SelectiveAdam
 from gsplat.rendering import rasterization
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
-from multigrid_gaussians_v8 import MultigridGaussians, quaternion_multiply
+from multigrid_gaussians_v8 import MultigridGaussians
 # load_hierarchy_multigrid is now a static method of MultigridGaussians
-
-
-opacity_grad_norms = []
 
 
 @dataclass
@@ -510,9 +506,6 @@ def load_hierarchy_leaf_nodes(
     
     splats = torch.nn.ParameterDict({n: v for n, v, _ in params}).to(device)
     
-    for name, param in splats.items():
-        param = param.contiguous()
-
     # Create optimizers (same as create_splats_with_optimizers)
     BS = batch_size * world_size
     optimizer_class = None
@@ -1426,8 +1419,6 @@ class Runner:
                     visibility_mask.scatter_(0, info["gaussian_ids"], 1)
                 else:
                     visibility_mask = (info["radii"] > 0).all(-1).any(0)
-
-            opacity_grad_norms.append(self.splats["opacities"].grad.norm().item())
 
             # optimize
             for optimizer in self.optimizers.values():
