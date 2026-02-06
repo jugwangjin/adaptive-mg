@@ -161,7 +161,7 @@ def main():
     parser.add_argument(
         "--reduction_factor",
         type=float,
-        default=0.5,
+        default=0.33,
         help="Factor to reduce number of Gaussians per level (default: 0.5)"
     )
     parser.add_argument(

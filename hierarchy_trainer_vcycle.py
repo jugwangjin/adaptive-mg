@@ -241,7 +241,7 @@ class Config:
     # Hierarchy consistency regularization
     # Enforces that parent gaussians match the aggregation of their children
     # This ensures consistency between fine and coarse levels
-    hierarchy_consistency_lambda: float = 1
+    hierarchy_consistency_lambda: float = 0.25
     # Weight one-hot regularization
     # Encourages weights to be one-hot like (sparse) by minimizing entropy
     # This makes aggregation more selective (one child dominates per parent)
@@ -332,6 +332,10 @@ class Config:
 
     # Hierarchy loading (required - loads hierarchy structure)
     hierarchy_path: Optional[str] = None
+    
+    # Fix means when loading hierarchy (for debugging)
+    # If True, means will not be updated during training when hierarchy is loaded
+    fix_means: bool = True
     
     # Profile timing for rendering vs consistency loss (for debugging)
     profile_timing: bool = False
@@ -922,6 +926,13 @@ class Runner:
         # Expose splats and optimizers
         self.splats = self.multigrid_gaussians.splats
         self.optimizers = self.multigrid_gaussians.optimizers
+
+        # Fix means if hierarchy is loaded and fix_means is enabled
+        # Remove means from optimizers so it won't be updated during training
+        if self.use_hierarchy and cfg.fix_means:
+            if "means" in self.optimizers:
+                del self.optimizers["means"]
+            print("Means are fixed (excluded from optimizers, not updated during training)")
 
         # Debug: Save level1, level2 point clouds and exit
         # from debug_codes import save_initialization_point_clouds
@@ -1814,7 +1825,7 @@ class Runner:
         info_other: Optional[Dict] = None,
         children_indices: Optional[torch.Tensor] = None,
         parent_ids: Optional[torch.Tensor] = None,
-    ) -> float:
+    ) -> Tuple[Tensor, Dict[str, Tensor], Optional[torch.Tensor]]:
         """
         Compute hierarchy consistency loss based on direction.
         
@@ -1840,6 +1851,7 @@ class Runner:
         Returns:
             hierarchy_loss: Scalar loss value
             losses_dict: Dictionary of individual loss components
+            affected_gaussians: Tensor of gaussian indices affected by this loss (None if no loss)
         """
         device = self.device
         cfg = self.cfg
@@ -1870,8 +1882,7 @@ class Runner:
         
         N = len(levels)
         if N == 0:
-
-            return torch.tensor(0.0, device=device), empty_losses_dict
+            return torch.tensor(0.0, device=device), empty_losses_dict, None
         
         # Compute children_indices and parent_ids if not provided
         if profile_detail:
@@ -1887,7 +1898,7 @@ class Runner:
             if children_indices is None or parent_ids is None:
                 cached_data = cache_for_direction.get(cache_key)
                 if cached_data is not None:
-                    # Use cached indices and mappings
+                # Use cached indices and mappings
                     if isinstance(cached_data, tuple) and len(cached_data) == 5:
                         # Extended cache: (children_indices, parent_ids, valid_parent_ids, parent_id_to_valid_idx, mapped_parent_ids)
                         children_indices, parent_ids, valid_parent_ids, parent_id_to_valid_idx, mapped_parent_ids = cached_data
@@ -1907,7 +1918,7 @@ class Runner:
                         empty_children = torch.tensor([], dtype=torch.long, device=device)
                         empty_parents = torch.tensor([], dtype=torch.long, device=device)
                         cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                        return torch.tensor(0.0, device=device), empty_losses_dict
+                        return torch.tensor(0.0, device=device), empty_losses_dict, None
                     
                     if direction == "downwards":
                         # Downwards: target_level-1 (parents)와 target_level (children) 이용
@@ -1918,7 +1929,7 @@ class Runner:
                             empty_children = torch.tensor([], dtype=torch.long, device=device)
                             empty_parents = torch.tensor([], dtype=torch.long, device=device)
                             cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                            return torch.tensor(0.0, device=device), empty_losses_dict
+                            return torch.tensor(0.0, device=device), empty_losses_dict, None
                         
                         # Find gaussians at parent_level and target_level
                         parent_level_mask = (levels == parent_level)
@@ -1927,7 +1938,7 @@ class Runner:
                             empty_children = torch.tensor([], dtype=torch.long, device=device)
                             empty_parents = torch.tensor([], dtype=torch.long, device=device)
                             cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                            return torch.tensor(0.0, device=device), empty_losses_dict
+                            return torch.tensor(0.0, device=device), empty_losses_dict, None
                         
                         # Children are at target_level
                         children_mask = target_level_mask  # [N,]
@@ -1937,7 +1948,7 @@ class Runner:
                             empty_children = torch.tensor([], dtype=torch.long, device=device)
                             empty_parents = torch.tensor([], dtype=torch.long, device=device)
                             cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                            return torch.tensor(0.0, device=device), empty_losses_dict
+                            return torch.tensor(0.0, device=device), empty_losses_dict, None
                         
                         # Get parent_ids for children
                         parent_ids = parent_indices[children_indices]  # [K,] - parent index for each child
@@ -1953,8 +1964,8 @@ class Runner:
                                 empty_children = torch.tensor([], dtype=torch.long, device=device)
                                 empty_parents = torch.tensor([], dtype=torch.long, device=device)
                                 cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                                return torch.tensor(0.0, device=device), empty_losses_dict
-                        
+                                return torch.tensor(0.0, device=device), empty_losses_dict, None
+                    
                     else:  # upwards
                         # Upwards: target_level (parents)와 target_level+1 (children) 이용
                         # target_level의 gaussians가 parents, target_level+1의 gaussians가 children
@@ -1967,7 +1978,7 @@ class Runner:
                             empty_children = torch.tensor([], dtype=torch.long, device=device)
                             empty_parents = torch.tensor([], dtype=torch.long, device=device)
                             cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                            return torch.tensor(0.0, device=device), empty_losses_dict
+                            return torch.tensor(0.0, device=device), empty_losses_dict, None
                         
                         # Children are at target_level+1
                         children_mask = child_level_mask  # [N,]
@@ -1977,7 +1988,7 @@ class Runner:
                             empty_children = torch.tensor([], dtype=torch.long, device=device)
                             empty_parents = torch.tensor([], dtype=torch.long, device=device)
                             cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                            return torch.tensor(0.0, device=device), empty_losses_dict
+                            return torch.tensor(0.0, device=device), empty_losses_dict, None
                         
                         # Get parent_ids for children
                         parent_ids = parent_indices[children_indices]  # [K,] - parent index for each child
@@ -1993,7 +2004,7 @@ class Runner:
                                 empty_children = torch.tensor([], dtype=torch.long, device=device)
                                 empty_parents = torch.tensor([], dtype=torch.long, device=device)
                                 cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                                return torch.tensor(0.0, device=device), empty_losses_dict
+                                return torch.tensor(0.0, device=device), empty_losses_dict, None
                     
                     # Compute mappings for caching
                     unique_parent_ids = torch.unique(parent_ids)  # [M,] where M <= K
@@ -2003,7 +2014,7 @@ class Runner:
                         empty_children = torch.tensor([], dtype=torch.long, device=device)
                         empty_parents = torch.tensor([], dtype=torch.long, device=device)
                         cache_for_direction[cache_key] = (empty_children, empty_parents, None, None, None)
-                        return torch.tensor(0.0, device=device), empty_losses_dict
+                        return torch.tensor(0.0, device=device), empty_losses_dict, None
                     
                     max_parent_id = unique_parent_ids.max().item()
                     parent_id_to_valid_idx = torch.full((max_parent_id + 1,), -1, dtype=torch.long, device=device)
@@ -2019,7 +2030,7 @@ class Runner:
         
         # Validate provided indices (check cached empty result)
         if len(children_indices) == 0:
-            return torch.tensor(0.0, device=device), empty_losses_dict
+            return torch.tensor(0.0, device=device), empty_losses_dict, None
         
         # CHANGED: Use individual parameters directly (no need for get_splats)
         # Individual parameters are stored directly in self.splats
@@ -2050,7 +2061,7 @@ class Runner:
             torch.cuda.synchronize()
             t_scale_exp = time.time()
             timings['weight_scale_exp'] = (t_scale_exp - t_weight_start) * 1000
-        
+            
         # Extract 2D projection data for children
         # downwards: children are at target_level, use info_current
         # upwards: children are at target_level+1, use info_other
@@ -2117,7 +2128,7 @@ class Runner:
             unique_parent_ids = torch.unique(parent_ids)  # [M,] where M <= K
             unique_parent_ids = unique_parent_ids[unique_parent_ids >= 0]  # Filter out -1
             if len(unique_parent_ids) == 0:
-                return torch.tensor(0.0, device=device), empty_losses_dict
+                return torch.tensor(0.0, device=device), empty_losses_dict, None
             
             if profile_detail:
                 torch.cuda.synchronize()
@@ -2134,14 +2145,14 @@ class Runner:
                 torch.cuda.synchronize()
                 t_weight_sum = time.time()
                 timings['weight_sum'] = (t_weight_sum - t_unique) * 1000
-            
+                
             # Filter out parents with no children (weight_sum = 0)
             valid_parent_ids = unique_parent_ids[parent_weight_sums[unique_parent_ids] > 1e-8]
             if len(valid_parent_ids) == 0:
-                return torch.tensor(0.0, device=device), empty_losses_dict
+                return torch.tensor(0.0, device=device), empty_losses_dict, None
             
             num_valid_parents = len(valid_parent_ids)
-            
+                
             if profile_detail:
                 torch.cuda.synchronize()
                 t_filter = time.time()
@@ -2169,7 +2180,14 @@ class Runner:
                 unnormalized_weights = unnormalized_weights[valid_parent_ids_mask]
                 K = len(children_indices)
                 if K == 0:
-                    return torch.tensor(0.0, device=device), empty_losses_dict
+                    return torch.tensor(0.0, device=device), empty_losses_dict, None
+            
+            # Store affected gaussians (children and parents) after filtering
+            # These are the gaussians that receive gradients from hierarchy consistency loss
+            affected_children = children_indices
+            affected_parents = parent_ids
+            # Combine and get unique indices (some parents might appear multiple times)
+            affected_gaussians = torch.unique(torch.cat([affected_children, affected_parents]))
             
             # Map parent_ids to valid indices (0..num_valid_parents-1)
             mapped_parent_ids = parent_id_to_valid_idx[parent_ids]  # [K,]
@@ -2188,6 +2206,13 @@ class Runner:
             max_parent_id = valid_parent_ids.max().item()
             parent_weight_sums = torch.zeros(max_parent_id + 1, device=device, dtype=unnormalized_weights.dtype)
             parent_weight_sums.scatter_add_(0, parent_ids, unnormalized_weights)
+        
+        # Store affected gaussians from cached indices
+        # These are the gaussians that receive gradients from hierarchy consistency loss
+        affected_children = children_indices
+        affected_parents = parent_ids
+        # Combine and get unique indices (some parents might appear multiple times)
+        affected_gaussians = torch.unique(torch.cat([affected_children, affected_parents]))
         
         # OPTIMIZED: Normalize weights per parent using precomputed sums
         if profile_detail:
@@ -2214,9 +2239,9 @@ class Runner:
         )  # [K, 3, 3]
         
         if profile_detail:
-            torch.cuda.synchronize()
-            t5 = time.time()
-            timings['children_covar'] = (t5 - t_weight_end) * 1000
+                torch.cuda.synchronize()
+                t5 = time.time()
+                timings['children_covar'] = (t5 - t_weight_end) * 1000
             
         # OPTIMIZED: Use num_valid_parents-sized tensors instead of N-sized
         # Aggregate children to get expected parent parameters
@@ -2493,7 +2518,7 @@ class Runner:
         }
 
 
-        return hierarchy_loss, losses_dict
+        return hierarchy_loss, losses_dict, affected_gaussians
 
     @torch.no_grad()
     def measure_metric_on_batch(
@@ -3060,7 +3085,7 @@ class Runner:
                         image_ids=image_ids,
                     )
             
-            hierarchy_loss, losses_dict = self._compute_hierarchy_consistency_loss(
+            hierarchy_loss, losses_dict, affected_gaussians = self._compute_hierarchy_consistency_loss(
                 target_level=target_level,
                 image_multigrid_max_level=image_multigrid_max_level,
                 direction=direction,
@@ -3154,6 +3179,14 @@ class Runner:
                 if len(visible_indices) > 0:
                     visibility_mask[visible_indices] = visibility_local
                 del radii, visibility_local, visible_indices
+            
+            # Add hierarchy consistency loss affected gaussians to visibility mask
+            # These gaussians receive gradients from hierarchy consistency loss and should be updated
+            if cfg.hierarchy_consistency_lambda > 0.0 and affected_gaussians is not None and len(affected_gaussians) > 0:
+                # Ensure affected_gaussians are within valid range
+                valid_affected = (affected_gaussians >= 0) & (affected_gaussians < len(visibility_mask))
+                if valid_affected.any():
+                    visibility_mask[affected_gaussians[valid_affected]] = True
 
         # optimize    
         # # Debug: Check parameter and optimizer state dtype/device/layout
@@ -3230,12 +3263,15 @@ class Runner:
         max_steps = cfg.max_steps
         init_step = 0
 
-        schedulers = [
+        schedulers = []
             # means has a learning rate schedule, that end at 0.01 of the initial value
+        # Only add scheduler if means optimizer exists (not fixed)
+        if "means" in self.optimizers:
+            schedulers.append(
             torch.optim.lr_scheduler.ExponentialLR(
                 self.optimizers["means"], gamma=0.01 ** (1.0 / max_steps)
-            ),
-        ]
+                )
+            )
         if cfg.pose_opt:
             # pose optimization has a learning rate schedule
             schedulers.append(

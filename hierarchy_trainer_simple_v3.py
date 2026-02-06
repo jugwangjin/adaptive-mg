@@ -45,7 +45,7 @@ from multigrid_gaussians_v8 import MultigridGaussians
 # load_hierarchy_multigrid is now a static method of MultigridGaussians
 
 # Import consistency loss functions from vcycle trainer
-from hierarchy_trainer_vcycle import Runner as VCycleRunner
+from hierarchy_trainer_vcycle_v3 import Runner as VCycleRunnerV3
 
 
 @dataclass
@@ -265,9 +265,6 @@ class Config:
             result_base = f"./results/hierarchy_trainer_simple/{dataset_name}_{settings_str}_hierarchy_unknown"
         if self.use_coarse_to_fine:
             result_base += "_c2f"
-        # Add suffix for no consistency loss (lower bound comparison)
-        if self.hierarchy_consistency_lambda == 0.0:
-            result_base += "_no_consistency"
         self.result_dir = result_base
 
     def adjust_steps(self, factor: float):
@@ -674,11 +671,10 @@ class Runner:
         print("Model initialized from hierarchy. Number of GS:", len(self.splats["means"]))
         print(f"Hierarchy has {self.hierarchy_num_levels} levels (max_level={self.max_level})")
 
-        # Load MultigridGaussians for hierarchy structure (for consistency loss)
-        # We only train leaf nodes (self.splats), but need full hierarchy for consistency loss
+        # Load MultigridGaussians for consistency loss (full hierarchy structure)
         self.use_hierarchy = cfg.hierarchy_path is not None
-        if cfg.hierarchy_consistency_lambda > 0.0:
-            print(f"Loading full hierarchy structure for consistency loss...")
+        if self.use_hierarchy and cfg.hierarchy_consistency_lambda > 0.0:
+            print(f"Loading full hierarchy from {cfg.hierarchy_path} for consistency loss...")
             self.multigrid_gaussians, _ = MultigridGaussians.load_hierarchy_multigrid(
                 hierarchy_path=cfg.hierarchy_path,
                 parser=self.parser,
@@ -699,7 +695,7 @@ class Runner:
                 world_rank=world_rank,
                 world_size=world_size,
                 position_scale_reduction=0.75,
-                max_level=None,
+                max_level=cfg.max_level,
             )
             # Initialize hierarchy index cache for consistency loss
             self._hierarchy_index_cache = {
@@ -1105,39 +1101,23 @@ class Runner:
             print(f"Warning: Leaf node count mismatch: {len(leaf_indices)} vs {len(self.splats['means'])}")
             return
         
-        # Sync all parameters
-        with torch.no_grad():
-            self.multigrid_gaussians.splats["means"][leaf_indices] = self.splats["means"]
-            self.multigrid_gaussians.splats["quats"][leaf_indices] = self.splats["quats"]
-            self.multigrid_gaussians.splats["scales"][leaf_indices] = self.splats["scales"]
-            self.multigrid_gaussians.splats["opacities"][leaf_indices] = self.splats["opacities"]
-            if "sh0" in self.splats:
-                self.multigrid_gaussians.splats["sh0"][leaf_indices] = self.splats["sh0"]
-            if "shN" in self.splats:
-                self.multigrid_gaussians.splats["shN"][leaf_indices] = self.splats["shN"]
-            if "colors" in self.splats:
-                self.multigrid_gaussians.splats["colors"][leaf_indices] = self.splats["colors"]
-            if "features" in self.splats:
-                self.multigrid_gaussians.splats["features"][leaf_indices] = self.splats["features"]
-        
-        # Re-enable gradients for leaf nodes
-        self.multigrid_gaussians.splats["means"][leaf_indices].requires_grad_(True)
-        self.multigrid_gaussians.splats["quats"][leaf_indices].requires_grad_(True)
-        self.multigrid_gaussians.splats["scales"][leaf_indices].requires_grad_(True)
-        self.multigrid_gaussians.splats["opacities"][leaf_indices].requires_grad_(True)
-        if "sh0" in self.splats:
-            self.multigrid_gaussians.splats["sh0"][leaf_indices].requires_grad_(True)
+        # Update multigrid_gaussians with current leaf node parameters
+        self.multigrid_gaussians.splats["means"][leaf_indices] = self.splats["means"].detach()
+        self.multigrid_gaussians.splats["scales"][leaf_indices] = self.splats["scales"].detach()
+        self.multigrid_gaussians.splats["quats"][leaf_indices] = self.splats["quats"].detach()
+        self.multigrid_gaussians.splats["opacities"][leaf_indices] = self.splats["opacities"].detach()
+        self.multigrid_gaussians.splats["sh0"][leaf_indices] = self.splats["sh0"].detach()
         if "shN" in self.splats:
-            self.multigrid_gaussians.splats["shN"][leaf_indices].requires_grad_(True)
+            self.multigrid_gaussians.splats["shN"][leaf_indices] = self.splats["shN"].detach()
         if "colors" in self.splats:
-            self.multigrid_gaussians.splats["colors"][leaf_indices].requires_grad_(True)
+            self.multigrid_gaussians.splats["colors"][leaf_indices] = self.splats["colors"].detach()
         if "features" in self.splats:
-            self.multigrid_gaussians.splats["features"][leaf_indices].requires_grad_(True)
+            self.multigrid_gaussians.splats["features"][leaf_indices] = self.splats["features"].detach()
 
     # Import consistency loss functions from vcycle trainer
-    _get_projection_only = VCycleRunner._get_projection_only
-    _extract_projection_data = VCycleRunner._extract_projection_data
-    _compute_hierarchy_consistency_loss = VCycleRunner._compute_hierarchy_consistency_loss
+    _get_projection_only = VCycleRunnerV3._get_projection_only
+    _extract_projection_data = VCycleRunnerV3._extract_projection_data
+    _compute_hierarchy_consistency_loss = VCycleRunnerV3._compute_hierarchy_consistency_loss
 
     def train(self):
         cfg = self.cfg

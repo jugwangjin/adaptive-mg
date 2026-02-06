@@ -1,0 +1,2 @@
+# Helper functions to add to hierarchy_trainer_simple_v2.py after rasterize_splats method
+# These are copied from hierarchy_trainer_vcycle_v2.py and adapted for simple trainers
